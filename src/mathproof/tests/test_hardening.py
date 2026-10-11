@@ -10,7 +10,16 @@ Each test maps to one named invariant:
 * C5  only proved-pending-replay may carry a candidate certificate.
 """
 
+import inspect
 import unittest
+
+from commit_gate.gate import CommitGate
+from commit_gate.apply import apply_ops
+from commit_gate.ops import AddEdge, SetField, UpsertNode
+from commit_gate.proposal import Proposal
+from commit_gate.reasons import Reason
+from commit_gate.state import MemoryView
+from commit_gate.store import JournalStore
 
 from mathproof.formal_atp import FakeFormalATP, build_result, stub_replay
 from mathproof.soundness import (
@@ -22,6 +31,17 @@ from mathproof.soundness import (
 
 ENV_A = "sha256:" + "c3" * 32
 ENV_B = "sha256:" + "9d" * 32
+
+
+def acquire_test_lease(
+    store: JournalStore, proof_id: str, lease_id: str, *, actor: str, worker_class: str
+) -> int:
+    """Run the parallel branch tests before and after the gate lease upgrade."""
+    if "actor" in inspect.signature(store.acquire_lease).parameters:
+        return store.acquire_lease(
+            proof_id, lease_id, actor=actor, worker_class=worker_class
+        )
+    return store.acquire_lease(proof_id, lease_id)
 
 
 def multi_child_result() -> dict:
@@ -191,6 +211,78 @@ class TestC3ReplayGateStub(unittest.TestCase):
             {v.reason for v in validate_formal_search_result(result)},
         )
 
+    def test_gate_state_machine_blocks_the_direct_jump(self):
+        """The same contract enforced by the commit gate's transition table."""
+        view = MemoryView()
+        store = JournalStore()
+        gate = CommitGate(view, store)
+        token = acquire_test_lease(
+            store, "p1", "lease-1", actor="coordinator", worker_class="coordinator"
+        )
+
+        # The newer gate accepts a candidate only with a complete declaration,
+        # producing-run, and pinned-environment binding.
+        create = Proposal(
+            proof_id="p1",
+            actor="coordinator",
+            worker_class="coordinator",
+            ops=(
+                UpsertNode("FormalDeclaration", "p1/decl-1", {}),
+                UpsertNode("Environment", "p1/env-1", {"environment_hash": ENV_A}),
+                UpsertNode(
+                    "FormalRun", "p1/run-1",
+                    {"status": "proved-pending-replay", "environment_hash": ENV_A},
+                ),
+                UpsertNode(
+                    "Certificate", "p1/cert-1",
+                    {
+                        "status": "candidate",
+                        "artifact_hash": "sha256:" + "18" * 32,
+                        "environment_hash": ENV_A,
+                        "producer_run_id": "p1/run-1",
+                    },
+                ),
+                AddEdge("CERTIFIES", "p1/cert-1", "p1/decl-1", "p1/certifies-1"),
+                AddEdge(
+                    "PRODUCED_CERTIFICATE", "p1/run-1", "p1/cert-1", "p1/produced-1"
+                ),
+                AddEdge("SEARCHES", "p1/run-1", "p1/decl-1", "p1/searches-1"),
+                AddEdge(
+                    "PINNED_ENVIRONMENT", "p1/decl-1", "p1/env-1", "p1/pin-1"
+                ),
+                AddEdge(
+                    "CERTIFICATE_ENVIRONMENT", "p1/cert-1", "p1/env-1", "p1/cert-env-1"
+                ),
+                AddEdge("RAN_UNDER", "p1/run-1", "p1/env-1", "p1/run-env-1"),
+            ),
+            base_revision=0,
+            lease_id="lease-1",
+            fencing_token=token,
+        )
+        accepted = gate.commit(create)
+        self.assertTrue(accepted.accepted, accepted.rejections)
+        apply_ops(view, create.ops)
+
+        skip = Proposal(
+            proof_id="p1",
+            actor="coordinator",
+            worker_class="coordinator",
+            ops=(
+                SetField(
+                    "Certificate", "p1/cert-1", "status",
+                    "replay-accepted", prior="candidate",
+                ),
+            ),
+            base_revision=1,
+            lease_id="lease-1",
+            fencing_token=token,
+        )
+        result = gate.commit(skip)
+        self.assertFalse(result.accepted)
+        self.assertEqual(
+            [r.reason for r in result.rejections], [Reason.ILLEGAL_STATUS_TRANSITION]
+        )
+
 
 class TestC4EnvironmentDrift(unittest.TestCase):
     """Sections 6.12 / 11.4: the current pin controls acceptance."""
@@ -231,6 +323,108 @@ class TestC4EnvironmentDrift(unittest.TestCase):
                 result, pinned_environment_hash=ENV_B
             )},
         )
+
+
+class TestC5StaleFencingToken(unittest.TestCase):
+    """Invariants 8/10 via the real gate: stale token rejected *and* journalled.
+
+    The scenario: worker A holds the lease, commits, then its lease is
+    renewed (a second acquire bumps the fencing token). A result still in
+    flight under the old token arrives -- it must be refused, leave committed
+    state untouched, and survive in the rejection audit log.
+    """
+
+    LEASE = "lease-worker-a"
+
+    def setUp(self):
+        self.view = MemoryView()
+        self.store = JournalStore()
+        self.gate = CommitGate(self.view, self.store)
+
+        self.token_one = acquire_test_lease(
+            self.store, "p1", self.LEASE,
+            actor="worker-a", worker_class="formal-atp",
+        )
+        first = Proposal(
+            proof_id="p1",
+            actor="worker-a",
+            worker_class="formal-atp",
+            ops=(UpsertNode("FormalState", "p1/fs-1", {"status": "open"}),),
+            base_revision=0,
+            lease_id=self.LEASE,
+            fencing_token=self.token_one,
+        )
+        self.assertTrue(self.gate.commit(first).accepted)
+        apply_ops(self.view, first.ops)
+
+        # The lease is renewed; token_one is now obsolete.
+        self.token_two = acquire_test_lease(
+            self.store, "p1", self.LEASE,
+            actor="worker-a", worker_class="formal-atp",
+        )
+        self.assertGreater(self.token_two, self.token_one)
+
+    def _late_proposal(self) -> Proposal:
+        return Proposal(
+            proof_id="p1",
+            actor="worker-a",
+            worker_class="formal-atp",
+            ops=(
+                SetField(
+                    "FormalState", "p1/fs-1", "status",
+                    "expanded", prior="open",
+                ),
+            ),
+            base_revision=1,
+            lease_id=self.LEASE,
+            fencing_token=self.token_one,
+        )
+
+    def test_superseded_token_is_rejected_with_typed_reason(self):
+        result = self.gate.commit(self._late_proposal())
+        self.assertFalse(result.accepted)
+        self.assertEqual(
+            [r.reason for r in result.rejections],
+            [Reason.FENCING_TOKEN_SUPERSEDED],
+        )
+
+    def test_rejected_write_changes_no_committed_state(self):
+        head_before = self.store.head("p1")
+        self.gate.commit(self._late_proposal())
+        self.assertEqual(self.store.head("p1"), head_before)
+        self.assertEqual(len(self.store.read_events("p1")), 1)
+
+    def test_rejection_remains_journaled_for_audit(self):
+        proposal = self._late_proposal()
+        self.gate.commit(proposal)
+
+        audit = self.store.read_rejections("p1")
+        self.assertEqual(len(audit), 1)
+        entry = audit[0]
+        self.assertEqual(entry["reason"], Reason.FENCING_TOKEN_SUPERSEDED.value)
+        self.assertIsNotNone(entry["payload"])
+        self.assertEqual(entry["payload"]["fencing_token"], self.token_one)
+        self.assertEqual(
+            entry["payload"]["ops"][0]["field"], "status"
+        )
+
+    def test_current_token_commits_where_the_stale_one_could_not(self):
+        self.gate.commit(self._late_proposal())
+        fresh = Proposal(
+            proof_id="p1",
+            actor="worker-a",
+            worker_class="formal-atp",
+            ops=(
+                SetField(
+                    "FormalState", "p1/fs-1", "status",
+                    "expanded", prior="open",
+                ),
+            ),
+            base_revision=1,
+            lease_id=self.LEASE,
+            fencing_token=self.token_two,
+        )
+        self.assertTrue(self.gate.commit(fresh).accepted)
 
 
 class TestC5CertificateDisposition(unittest.TestCase):
