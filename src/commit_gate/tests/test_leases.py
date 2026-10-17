@@ -260,6 +260,9 @@ class TestDispatchLeases(unittest.TestCase):
 
         live = {row.lease_id for row in self.store.active_leases("p1")}
         self.assertEqual(live, {"maintenance-lock"})
+        with self.assertRaises(ConcurrencyError):
+            self.issue("ls-2", "p1/rm-2")
+        self.assertEqual(len(self.store.active_leases("p1")), 1)
 
     def test_tokens_never_repeat_across_mixed_acquisitions(self):
         tokens = [

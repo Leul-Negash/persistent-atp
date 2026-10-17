@@ -312,6 +312,17 @@ class JournalStore:
         with self._write() as conn:
             now_ns = self._clock_ns()
             self._expire_due_leases(conn, proof_id, now_ns)
+            exclusive = conn.execute(
+                """
+                SELECT 1 FROM leases
+                WHERE proof_id = ? AND status = 'active' AND selected_move_id IS NULL
+                """,
+                (proof_id,),
+            ).fetchone()
+            if exclusive is not None:
+                raise ConcurrencyError(
+                    Reason.LEASE_NOT_HELD, "proof is held by an exclusive lease"
+                )
             revision = self.head(proof_id)[0]
             if base_revision is not None and (
                 type(base_revision) is not int or base_revision != revision
