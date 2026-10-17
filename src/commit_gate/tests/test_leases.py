@@ -165,6 +165,17 @@ class TestDispatchLeases(unittest.TestCase):
         self.assertFalse(gate.commit(self.proposal(stale)).accepted)
         self.assertTrue(gate.commit(self.proposal(fresh)).accepted)
 
+    def test_late_release_cannot_cancel_a_renewed_lease(self):
+        old = self.issue("ls-1", "p1/rm-1")
+        renewed = self.issue("ls-1", "p1/rm-1")
+        self.assertFalse(self.store.release_lease(
+            "p1", old.lease_id, fencing_token=old.fencing_token
+        ))
+        gate = CommitGate(self._seeded_view(), self.store)
+        self.assertTrue(gate.commit(self.proposal(renewed)).accepted)
+        with self.assertRaises(ValueError):
+            self.store.release_lease("p1", renewed.lease_id, fencing_token=True)
+
     def test_supersession_is_audited_once_with_the_previous_holder(self):
         leases = [self.issue(f"ls-{i}", "p1/rm-1", actor=f"worker-{i}") for i in range(3)]
         events = self.store.read_lease_events("p1")
@@ -231,7 +242,7 @@ class TestDispatchLeases(unittest.TestCase):
 
     def test_released_lease_cannot_commit(self):
         lease = self.issue("ls-1", "p1/rm-1")
-        self.assertTrue(self.store.release_lease("p1", "ls-1"))
+        self.assertTrue(self.store.release_lease("p1", "ls-1", fencing_token=lease.fencing_token))
         gate = CommitGate(self._seeded_view(), self.store)
         result = gate.commit(claim_status_proposal(
             "p1/c-1", lease_id=lease.lease_id, fencing_token=lease.fencing_token,
@@ -258,7 +269,7 @@ class TestDispatchLeases(unittest.TestCase):
         tokens.append(self.store.acquire_lease(
             "p1", "lock", actor="maintenance", worker_class="maintenance"
         ))
-        self.store.release_lease("p1", "lock")
+        self.store.release_lease("p1", "lock", fencing_token=tokens[-1])
         tokens.append(self.issue("ls-3", "p1/rm-3").fencing_token)
         self.assertEqual(sorted(tokens), [1, 2, 3, 4])
 
@@ -351,7 +362,7 @@ class TestLeaseMigration(unittest.TestCase):
             self.assertEqual(store.verify_chain("p1"), 1)
             self.assertEqual(store.active_leases("p1")[0].actor, "worker")
             self.assertEqual(store.read_lease_events("p1")[0]["fencing_token"], 7)
-            self.assertTrue(store.release_lease("p1", "old"))
+            self.assertTrue(store.release_lease("p1", "old", fencing_token=7))
             fresh = store.issue_lease(
                 "p1", "new", actor="worker", worker_class="coordinator", selected_move_id="p1/rm-1"
             )

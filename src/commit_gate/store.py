@@ -372,18 +372,20 @@ class JournalStore:
         return self._lease_row(row)
 
     def release_lease(
-        self, proof_id: str, lease_id: str,
+        self, proof_id: str, lease_id: str, *, fencing_token: int,
     ) -> bool:
-        """Release the current lease when the scheduler finishes work."""
+        """Release only this generation, so a late release cannot kill a renewal."""
+        if type(fencing_token) is not int or fencing_token <= 0:
+            raise ValueError("release needs a positive integer fencing token")
         with self._write() as conn:
             now_ns = self._clock_ns()
             self._expire_due_leases(conn, proof_id, now_ns)
             row = conn.execute(
                 """
                 SELECT * FROM leases WHERE proof_id = ? AND lease_id = ?
-                AND status = 'active'
+                AND fencing_token = ? AND status = 'active'
                 """,
-                (proof_id, lease_id),
+                (proof_id, lease_id, fencing_token),
             ).fetchone()
             if row is None:
                 return False
