@@ -4,30 +4,24 @@ The journal is the durability authority: an event is committed when it is here.
 Every mutation runs inside one `BEGIN IMMEDIATE` transaction, so reading the
 head and inserting its successor cannot interleave with another writer.
 
-Only the commit gate may call the mutating methods. Leases are scheduling
-state, not committed proof state: they live beside the journal (never in the
-hash chain) so dispatching work does not advance a proof's revision, and every
-lease transition is mirrored into an append-only `lease_events` audit trail.
+Only the commit gate may call the mutating methods.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Iterator, Sequence
 
 from .canon import GENESIS_HASH, canonical_json, chain_hash
 from .reasons import Reason
+from .vocab import WorkerClass
 
-__all__ = [
-    "JournalStore",
-    "ConcurrencyError",
-    "HashChainError",
-    "LeaseRow",
-]
+__all__ = ["JournalStore", "ConcurrencyError", "HashChainError", "LeaseRow"]
 
 
 class ConcurrencyError(Exception):
@@ -49,10 +43,11 @@ class HashChainError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class LeaseRow:
-    """One issued lease as the store records it."""
+    """One dispatch or proof-wide lease, including its trusted holder."""
 
     proof_id: str
     lease_id: str
+    actor: str
     worker_class: str
     selected_move_id: str | None
     fencing_token: int
@@ -60,35 +55,24 @@ class LeaseRow:
     ttl_seconds: float
     issued_at: float
     expires_at: float | None
-    status: str  # active | expired | released | superseded
+    status: str
 
     def is_live(self, now: float) -> bool:
-        """Held and unexpired: usable for a commit."""
-        return self.status == "active" and (self.expires_at is None or now < self.expires_at)
+        return (
+            self.status == "active" and self.expires_at is not None
+            and now < self.expires_at
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "proof_id": self.proof_id,
-            "lease_id": self.lease_id,
-            "worker_class": self.worker_class,
-            "selected_move_id": self.selected_move_id,
-            "fencing_token": self.fencing_token,
-            "base_revision": self.base_revision,
-            "ttl_seconds": self.ttl_seconds,
-            "issued_at": self.issued_at,
-            "expires_at": self.expires_at,
-            "status": self.status,
-        }
+        return asdict(self)
 
 
 class JournalStore:
     """A SQLite-backed append-only journal of proof events."""
 
     def __init__(
-        self,
-        db_path: str = ":memory:",
-        busy_timeout_ms: int = 5000,
-        clock: Callable[[], float] = time.time,
+        self, db_path: str = ":memory:", busy_timeout_ms: int = 5000,
+        *, clock_ns: Callable[[], int] = time.time_ns,
     ):
         # Autocommit mode: `with conn:` begins no transaction when
         # isolation_level is None, so `_write` opens them explicitly.
@@ -97,106 +81,138 @@ class JournalStore:
         self._conn = sqlite3.connect(
             db_path, isolation_level=None, timeout=busy_timeout_ms / 1000
         )
+        self._clock_ns = clock_ns
         self._conn.row_factory = sqlite3.Row
-        self._clock = clock
-        # Must precede any locking pragma below: `busy_timeout` itself takes
-        # no lock, and the conversion to WAL does not honor the connect-time
-        # timeout, so it needs the retry loop itself.
         self._conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-        # WAL lets a projector read the journal while a worker writes it.
-        # Only the first connection converts the database (WAL is
-        # persistent); that conversion needs a brief exclusive lock and, unlike
-        # ordinary statements, fails immediately under contention rather than
-        # waiting on the busy handler -- so a fresh opener retries a few times
-        # instead of surfacing `database is locked`.
-        self._set_wal_mode()
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._init_schema()
-
-    def _set_wal_mode(self) -> None:
-        """Convert the database to WAL, tolerating racing openers.
-
-        A clean non-WAL answer is permanent -- an in-memory database reports
-        'memory' -- so only a lock failure retries, a few times before
-        giving up and surfacing the error.
-        """
+        # Concurrent openers can race while first enabling persistent WAL.
         for attempt in range(5):
             try:
                 self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
-                return
-            except sqlite3.OperationalError:
-                if attempt == 4:
+                break
+            except sqlite3.OperationalError as exc:
+                if attempt == 4 or "locked" not in str(exc).lower():
                     raise
                 time.sleep(0.05)
+        self._conn.execute("PRAGMA synchronous=FULL")
+        self._init_schema()
 
-    def _init_schema(self) -> None:
-        self._conn.execute(
+    @staticmethod
+    def _create_leases(conn: sqlite3.Connection) -> None:
+        conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS journal (
-                proof_id TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                event_hash TEXT NOT NULL UNIQUE,
-                prev_hash TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                worker_class TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                committed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (proof_id, revision)
-            )
-            """
-        )
-        columns = {
-            row["name"]
-            for row in self._conn.execute("PRAGMA table_info(leases)").fetchall()
-        }
-        if columns and "status" not in columns:
-            # Pre-scheduler shape (one write-lease row per proof): no live
-            # deployments read it, so rebuild rather than migrate.
-            self._conn.execute("DROP TABLE leases")
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS leases (
+            CREATE TABLE leases (
                 proof_id TEXT NOT NULL,
                 lease_id TEXT NOT NULL,
-                worker_class TEXT NOT NULL DEFAULT '',
-                selected_move_id TEXT,
                 fencing_token INTEGER NOT NULL,
+                actor TEXT,
+                worker_class TEXT,
+                expires_at_ns INTEGER,
+                selected_move_id TEXT,
                 base_revision INTEGER NOT NULL DEFAULT 0,
                 ttl_seconds REAL NOT NULL DEFAULT 0,
-                issued_at REAL NOT NULL,
-                expires_at REAL,
+                issued_at_ns INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'active',
                 PRIMARY KEY (proof_id, lease_id)
             )
             """
         )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS lease_events (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                proof_id TEXT NOT NULL,
-                lease_id TEXT NOT NULL,
-                event TEXT NOT NULL,
-                fencing_token INTEGER,
-                worker_class TEXT,
-                selected_move_id TEXT,
-                score_snapshot TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+
+    def _init_schema(self) -> None:
+        # Include schema inspection and migration in the same lock: a second
+        # connection must not observe or repeat a partially upgraded schema.
+        with self._write() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS journal (
+                    proof_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    event_hash TEXT NOT NULL UNIQUE,
+                    prev_hash TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    worker_class TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    committed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (proof_id, revision)
+                )
+                """
             )
-            """
-        )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rejections (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                proof_id TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                detail TEXT NOT NULL,
-                payload TEXT,
-                committed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(leases)")
+            }
+            if not columns:
+                self._create_leases(conn)
+            elif "status" not in columns:
+                # Preserve every legacy token, including leases that predate
+                # holder binding. Unbound leases cannot become active again.
+                for name, kind in (
+                    ("actor", "TEXT"), ("worker_class", "TEXT"),
+                    ("expires_at_ns", "INTEGER"),
+                ):
+                    if name not in columns:
+                        conn.execute(f"ALTER TABLE leases ADD COLUMN {name} {kind}")
+                conn.execute("ALTER TABLE leases RENAME TO leases_legacy")
+                self._create_leases(conn)
+                conn.execute(
+                    """
+                    INSERT INTO leases (
+                        proof_id, lease_id, fencing_token, actor, worker_class,
+                        expires_at_ns, status
+                    )
+                    SELECT proof_id, lease_id, fencing_token, actor, worker_class,
+                           expires_at_ns,
+                           CASE
+                             WHEN actor IS NULL OR actor = ''
+                               OR worker_class IS NULL OR worker_class = ''
+                               OR expires_at_ns IS NULL THEN 'superseded'
+                             ELSE 'active'
+                           END
+                    FROM leases_legacy
+                    """
+                )
+                conn.execute("DROP TABLE leases_legacy")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS active_move_lease
+                ON leases (proof_id, selected_move_id)
+                WHERE status = 'active' AND selected_move_id IS NOT NULL
+                """
             )
-            """
-        )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_audit (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proof_id TEXT NOT NULL,
+                    lease_id TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL,
+                    actor TEXT NOT NULL,
+                    worker_class TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    occurred_at_ns INTEGER NOT NULL,
+                    expires_at_ns INTEGER NOT NULL
+                )
+                """
+            )
+            audit_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(lease_audit)")
+            }
+            for name, kind in (
+                ("selected_move_id", "TEXT"), ("score_snapshot", "TEXT"),
+                ("base_revision", "INTEGER"),
+            ):
+                if name not in audit_columns:
+                    conn.execute(f"ALTER TABLE lease_audit ADD COLUMN {name} {kind}")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rejections (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proof_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    payload TEXT,
+                    committed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -239,311 +255,241 @@ class JournalStore:
             return 0, GENESIS_HASH
         return row["revision"], row["event_hash"]
 
-    # -- leases -------------------------------------------------------------
-    #
-    # Two issuance shapes share one monotonic token counter per proof:
-    #
-    #   acquire_lease  -- the proof-level write lock (8.4): issuing it
-    #     supersedes every other active lease on the proof. Coordinator-grade
-    #     structural work holds this; scheduler-dispatched workers then lose
-    #     their leases and must re-lease, which is the point of an exclusive
-    #     maintenance window.
-    #   issue_lease    -- one move dispatch (2.x): supersedes only an active
-    #     lease on the same move, so distinct moves run concurrently while a
-    #     move is never double-dispatched.
-    #
-    # A commit must name (lease_id, fencing_token) matching an *active,
-    # unexpired* lease; expired/superseded/released rows are dead forever
-    # because tokens never repeat.
+    @staticmethod
+    def _validate_holder(actor: str, worker_class: str, ttl_seconds: float) -> str:
+        if not isinstance(actor, str) or not actor.strip():
+            raise ValueError("a lease needs a nonempty actor")
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or not math.isfinite(ttl_seconds)
+            or not 0 < ttl_seconds <= 86_400
+        ):
+            raise ValueError("lease ttl_seconds must be between 0 and 86400")
+        try:
+            return WorkerClass(worker_class).value
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"unknown worker class {worker_class!r}") from exc
 
-    def acquire_lease(self, proof_id: str, lease_id: str, ttl_seconds: float = 0.0) -> int:
-        """Take the exclusive write lease on `proof_id`; return its token.
-
-        Tokens increase monotonically per proof and never repeat. Any ttl
-        given also bounds this acquisition; 0 means no expiry.
-        """
+    def acquire_lease(
+        self, proof_id: str, lease_id: str, *, actor: str, worker_class: str,
+        ttl_seconds: float = 300.0,
+    ) -> int:
+        """Take an exclusive proof-wide lease, superseding all dispatches."""
+        worker_class = self._validate_holder(actor, worker_class, ttl_seconds)
         with self._write() as conn:
-            self._expire_due_leases(conn, proof_id)
-            conn.execute(
-                """
-                UPDATE leases SET status = 'superseded'
-                WHERE proof_id = ? AND status = 'active' AND lease_id <> ?
-                """,
-                (proof_id, lease_id),
-            )
-            for row in conn.execute(
-                "SELECT lease_id FROM leases WHERE proof_id = ? AND status = 'superseded'",
+            now_ns = self._clock_ns()
+            self._expire_due_leases(conn, proof_id, now_ns)
+            rows = conn.execute(
+                "SELECT * FROM leases WHERE proof_id = ? AND status = 'active'",
                 (proof_id,),
-            ):
-                self._record_lease_event(
-                    conn, proof_id, row["lease_id"], "superseded"
-                )
-            token = self._next_token(conn, proof_id)
-            now = self._clock()
-            expires_at = now + ttl_seconds if ttl_seconds > 0 else None
-            conn.execute(
-                """
-                INSERT INTO leases (
-                    proof_id, lease_id, worker_class, selected_move_id,
-                    fencing_token, base_revision, ttl_seconds,
-                    issued_at, expires_at, status
-                ) VALUES (?, ?, '', NULL, ?, ?, ?, ?, ?, 'active')
-                ON CONFLICT(proof_id, lease_id) DO UPDATE SET
-                    worker_class = '',
-                    selected_move_id = NULL,
-                    fencing_token = excluded.fencing_token,
-                    base_revision = excluded.base_revision,
-                    ttl_seconds = excluded.ttl_seconds,
-                    issued_at = excluded.issued_at,
-                    expires_at = excluded.expires_at,
-                    status = 'active'
-                """,
-                (
-                    proof_id,
-                    lease_id,
-                    token,
-                    self.head(proof_id)[0],
-                    ttl_seconds,
-                    now,
-                    expires_at,
-                ),
+            ).fetchall()
+            self._supersede_leases(conn, rows, now_ns)
+            lease = self._insert_lease(
+                conn, proof_id, lease_id, actor, worker_class, None,
+                self.head(proof_id)[0], ttl_seconds, now_ns, "acquired",
             )
-            self._record_lease_event(
-                conn, proof_id, lease_id, "issued", fencing_token=token
-            )
-        return token
+        return lease.fencing_token
 
     def issue_lease(
-        self,
-        proof_id: str,
-        lease_id: str,
-        *,
-        worker_class: str,
-        selected_move_id: str | None = None,
-        base_revision: int | None = None,
+        self, proof_id: str, lease_id: str, *, actor: str, worker_class: str,
+        selected_move_id: str, base_revision: int | None = None,
         ttl_seconds: float = 600.0,
         score_snapshot: dict[str, Any] | None = None,
     ) -> LeaseRow:
-        """Issue one scheduler dispatch lease (Section 2).
+        """Dispatch one move; distinct moves may hold leases concurrently.
 
-        One indivisible operation inside the journal write lock: lapse any
-        due leases on this proof, supersede any active lease still held
-        against the same move, mint the next fencing token, record the lease
-        with its score snapshot in the audit trail, and return the row.
+        Reissuing a move renews ownership with a new token. The trusted
+        scheduler binds the worker identity to the assigned lease.
         """
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
+        worker_class = self._validate_holder(actor, worker_class, ttl_seconds)
+        if (
+            not isinstance(selected_move_id, str)
+            or not selected_move_id.startswith(f"{proof_id}/")
+            or selected_move_id == f"{proof_id}/"
+        ):
+            raise ValueError("a dispatch lease needs a move in the proof namespace")
         with self._write() as conn:
-            self._expire_due_leases(conn, proof_id)
-            if selected_move_id is not None:
-                conn.execute(
-                    """
-                    UPDATE leases SET status = 'superseded'
-                    WHERE proof_id = ? AND status = 'active'
-                      AND selected_move_id IS ?
-                      AND lease_id <> ?
-                    """,
-                    (proof_id, selected_move_id, lease_id),
+            now_ns = self._clock_ns()
+            self._expire_due_leases(conn, proof_id, now_ns)
+            revision = self.head(proof_id)[0]
+            if base_revision is not None and (
+                type(base_revision) is not int or base_revision != revision
+            ):
+                raise ConcurrencyError(
+                    Reason.STALE_BASE_REVISION,
+                    f"dispatch is based on revision {base_revision!r}, head is {revision}",
                 )
-                for row in conn.execute(
-                    """
-                    SELECT lease_id FROM leases
-                    WHERE proof_id = ? AND status = 'superseded'
-                      AND selected_move_id IS ? AND lease_id <> ?
-                    """,
-                    (proof_id, selected_move_id, lease_id),
-                ):
-                    self._record_lease_event(
-                        conn, proof_id, row["lease_id"], "superseded"
-                    )
-            token = self._next_token(conn, proof_id)
-            now = self._clock()
-            revision = (
-                self.head(proof_id)[0] if base_revision is None else base_revision
-            )
-            conn.execute(
+            rows = conn.execute(
                 """
-                INSERT INTO leases (
-                    proof_id, lease_id, worker_class, selected_move_id,
-                    fencing_token, base_revision, ttl_seconds,
-                    issued_at, expires_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-                ON CONFLICT(proof_id, lease_id) DO UPDATE SET
-                    worker_class = excluded.worker_class,
-                    selected_move_id = excluded.selected_move_id,
-                    fencing_token = excluded.fencing_token,
-                    base_revision = excluded.base_revision,
-                    ttl_seconds = excluded.ttl_seconds,
-                    issued_at = excluded.issued_at,
-                    expires_at = excluded.expires_at,
-                    status = 'active'
+                SELECT * FROM leases WHERE proof_id = ? AND status = 'active'
+                AND (selected_move_id = ? OR lease_id = ?)
                 """,
-                (
-                    proof_id,
-                    lease_id,
-                    worker_class,
-                    selected_move_id,
-                    token,
-                    revision,
-                    ttl_seconds,
-                    now,
-                    now + ttl_seconds,
-                ),
-            )
-            self._record_lease_event(
-                conn,
-                proof_id,
-                lease_id,
-                "issued",
-                fencing_token=token,
-                worker_class=worker_class,
-                selected_move_id=selected_move_id,
-                score_snapshot=score_snapshot,
-            )
-            return LeaseRow(
-                proof_id=proof_id,
-                lease_id=lease_id,
-                worker_class=worker_class,
-                selected_move_id=selected_move_id,
-                fencing_token=token,
-                base_revision=revision,
-                ttl_seconds=ttl_seconds,
-                issued_at=now,
-                expires_at=now + ttl_seconds,
-                status="active",
+                (proof_id, selected_move_id, lease_id),
+            ).fetchall()
+            self._supersede_leases(conn, rows, now_ns)
+            return self._insert_lease(
+                conn, proof_id, lease_id, actor, worker_class, selected_move_id,
+                revision, ttl_seconds, now_ns, "issued", score_snapshot,
             )
 
-    def release_lease(self, proof_id: str, lease_id: str) -> bool:
-        """Mark a lease finished; its token can never commit again."""
+    def _insert_lease(
+        self, conn: sqlite3.Connection, proof_id: str, lease_id: str,
+        actor: str, worker_class: str, selected_move_id: str | None,
+        base_revision: int, ttl_seconds: float, now_ns: int, event: str,
+        score_snapshot: dict[str, Any] | None = None,
+    ) -> LeaseRow:
+        row = conn.execute(
+            "SELECT MAX(fencing_token) AS top FROM leases WHERE proof_id = ?",
+            (proof_id,),
+        ).fetchone()
+        token = (row["top"] or 0) + 1
+        expires_at_ns = now_ns + max(1, int(ttl_seconds * 1_000_000_000))
+        conn.execute(
+            """
+            INSERT INTO leases (
+                proof_id, lease_id, fencing_token, actor, worker_class,
+                expires_at_ns, selected_move_id, base_revision,
+                ttl_seconds, issued_at_ns, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            ON CONFLICT(proof_id, lease_id) DO UPDATE SET
+                fencing_token = excluded.fencing_token,
+                actor = excluded.actor, worker_class = excluded.worker_class,
+                expires_at_ns = excluded.expires_at_ns,
+                selected_move_id = excluded.selected_move_id,
+                base_revision = excluded.base_revision,
+                ttl_seconds = excluded.ttl_seconds,
+                issued_at_ns = excluded.issued_at_ns, status = 'active'
+            """,
+            (proof_id, lease_id, token, actor, worker_class, expires_at_ns,
+             selected_move_id, base_revision, ttl_seconds, now_ns),
+        )
+        row = conn.execute(
+            "SELECT * FROM leases WHERE proof_id = ? AND lease_id = ?",
+            (proof_id, lease_id),
+        ).fetchone()
+        self._record_lease_event(conn, row, event, now_ns, score_snapshot)
+        return self._lease_row(row)
+
+    def release_lease(
+        self, proof_id: str, lease_id: str,
+    ) -> bool:
+        """Release the current lease when the scheduler finishes work."""
         with self._write() as conn:
-            cursor = conn.execute(
+            now_ns = self._clock_ns()
+            self._expire_due_leases(conn, proof_id, now_ns)
+            row = conn.execute(
                 """
-                UPDATE leases SET status = 'released'
-                WHERE proof_id = ? AND lease_id = ? AND status = 'active'
+                SELECT * FROM leases WHERE proof_id = ? AND lease_id = ?
+                AND status = 'active'
                 """,
                 (proof_id, lease_id),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                "UPDATE leases SET status = 'released' WHERE proof_id = ? AND lease_id = ?",
+                (proof_id, lease_id),
             )
-            if cursor.rowcount:
-                self._record_lease_event(conn, proof_id, lease_id, "released")
-            return bool(cursor.rowcount)
+            self._record_lease_event(conn, row, "released", now_ns)
+        return True
 
     def active_leases(self, proof_id: str) -> list[LeaseRow]:
-        """Live leases on this proof, lapsing any that are due first."""
         with self._write() as conn:
-            self._expire_due_leases(conn, proof_id)
+            self._expire_due_leases(conn, proof_id, self._clock_ns())
             rows = conn.execute(
-                "SELECT * FROM leases WHERE proof_id = ? AND status = 'active'",
+                """
+                SELECT * FROM leases WHERE proof_id = ? AND status = 'active'
+                ORDER BY fencing_token
+                """,
                 (proof_id,),
             ).fetchall()
         return [self._lease_row(row) for row in rows]
 
     def read_lease_events(self, proof_id: str) -> Sequence[dict[str, Any]]:
-        """The append-only audit trail of lease transitions, oldest first."""
+        """Lease history lives in the existing audit table, outside proof history."""
         rows = self._conn.execute(
             """
-            SELECT seq, lease_id, event, fencing_token, worker_class,
-                   selected_move_id, score_snapshot, created_at
-            FROM lease_events WHERE proof_id = ? ORDER BY seq ASC
+            SELECT *, datetime(occurred_at_ns / 1000000000, 'unixepoch') AS created_at
+            FROM lease_audit WHERE proof_id = ? ORDER BY seq
             """,
             (proof_id,),
         ).fetchall()
         return [
             {
-                "seq": row["seq"],
-                "lease_id": row["lease_id"],
-                "event": row["event"],
-                "fencing_token": row["fencing_token"],
-                "worker_class": row["worker_class"],
+                "seq": row["seq"], "lease_id": row["lease_id"],
+                "event": row["event_type"], "fencing_token": row["fencing_token"],
+                "actor": row["actor"], "worker_class": row["worker_class"],
                 "selected_move_id": row["selected_move_id"],
+                "base_revision": row["base_revision"],
                 "score_snapshot": (
-                    json.loads(row["score_snapshot"])
-                    if row["score_snapshot"]
-                    else None
+                    json.loads(row["score_snapshot"]) if row["score_snapshot"] else None
                 ),
-                "created_at": row["created_at"],
+                "occurred_at_ns": row["occurred_at_ns"],
+                "expires_at_ns": row["expires_at_ns"], "created_at": row["created_at"],
             }
             for row in rows
         ]
 
     @staticmethod
-    def _next_token(conn: sqlite3.Connection, proof_id: str) -> int:
-        row = conn.execute(
-            "SELECT MAX(fencing_token) AS top FROM leases WHERE proof_id = ?",
-            (proof_id,),
-        ).fetchone()
-        return (row["top"] or 0) + 1
-
-    def _expire_due_leases(self, conn: sqlite3.Connection, proof_id: str) -> int:
-        """Lapse every active lease past its expiry; return how many."""
-        now = self._clock()
-        due = conn.execute(
-            """
-            SELECT lease_id FROM leases
-            WHERE proof_id = ? AND status = 'active'
-              AND expires_at IS NOT NULL AND expires_at <= ?
-            """,
-            (proof_id, now),
-        ).fetchall()
-        for row in due:
-            conn.execute(
-                """
-                UPDATE leases SET status = 'expired'
-                WHERE proof_id = ? AND lease_id = ?
-                """,
-                (proof_id, row["lease_id"]),
-            )
-            self._record_lease_event(
-                conn, proof_id, row["lease_id"], "expired", when=now
-            )
-        return len(due)
+    def _lease_row(row: sqlite3.Row) -> LeaseRow:
+        return LeaseRow(
+            proof_id=row["proof_id"], lease_id=row["lease_id"],
+            actor=row["actor"], worker_class=row["worker_class"],
+            selected_move_id=row["selected_move_id"], fencing_token=row["fencing_token"],
+            base_revision=row["base_revision"], ttl_seconds=row["ttl_seconds"],
+            issued_at=row["issued_at_ns"] / 1_000_000_000,
+            expires_at=(row["expires_at_ns"] / 1_000_000_000
+                        if row["expires_at_ns"] is not None else None),
+            status=row["status"],
+        )
 
     @staticmethod
     def _record_lease_event(
-        conn: sqlite3.Connection,
-        proof_id: str,
-        lease_id: str,
-        event: str,
-        *,
-        fencing_token: int | None = None,
-        worker_class: str | None = None,
-        selected_move_id: str | None = None,
+        conn: sqlite3.Connection, row: sqlite3.Row, event: str, now_ns: int,
         score_snapshot: dict[str, Any] | None = None,
-        when: float | None = None,
     ) -> None:
         conn.execute(
             """
-            INSERT INTO lease_events (
-                proof_id, lease_id, event, fencing_token, worker_class,
-                selected_move_id, score_snapshot
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO lease_audit (
+                proof_id, lease_id, fencing_token, actor, worker_class,
+                event_type, occurred_at_ns, expires_at_ns,
+                selected_move_id, score_snapshot, base_revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                proof_id,
-                lease_id,
-                event,
-                fencing_token,
-                worker_class,
-                selected_move_id,
-                canonical_json(score_snapshot).decode("utf-8")
-                if score_snapshot is not None
-                else None,
-            ),
+            (row["proof_id"], row["lease_id"], row["fencing_token"],
+             row["actor"], row["worker_class"], event, now_ns, row["expires_at_ns"],
+             row["selected_move_id"],
+             canonical_json(score_snapshot).decode("utf-8")
+             if score_snapshot is not None else None, row["base_revision"]),
         )
 
-    @staticmethod
-    def _lease_row(row: sqlite3.Row) -> LeaseRow:
-        return LeaseRow(
-            proof_id=row["proof_id"],
-            lease_id=row["lease_id"],
-            worker_class=row["worker_class"],
-            selected_move_id=row["selected_move_id"],
-            fencing_token=row["fencing_token"],
-            base_revision=row["base_revision"],
-            ttl_seconds=row["ttl_seconds"],
-            issued_at=row["issued_at"],
-            expires_at=row["expires_at"],
-            status=row["status"],
-        )
+    def _supersede_leases(
+        self, conn: sqlite3.Connection, rows: Sequence[sqlite3.Row], now_ns: int,
+    ) -> None:
+        for row in rows:
+            conn.execute(
+                "UPDATE leases SET status = 'superseded' WHERE proof_id = ? AND lease_id = ?",
+                (row["proof_id"], row["lease_id"]),
+            )
+            self._record_lease_event(conn, row, "superseded", now_ns)
+
+    def _expire_due_leases(
+        self, conn: sqlite3.Connection, proof_id: str, now_ns: int,
+    ) -> None:
+        rows = conn.execute(
+            """
+            SELECT * FROM leases WHERE proof_id = ? AND status = 'active'
+            AND expires_at_ns <= ?
+            """,
+            (proof_id, now_ns),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE leases SET status = 'expired' WHERE proof_id = ? AND lease_id = ?",
+                (proof_id, row["lease_id"]),
+            )
+            self._record_lease_event(conn, row, "expired", now_ns)
 
     def append(self, payload_dict: dict[str, Any]) -> tuple[int, str]:
         """Append one already-validated proposal; return `(revision, event_hash)`.
@@ -556,89 +502,105 @@ class JournalStore:
         payload: chaining onto a corrupt hash would bury the corruption under
         a link that verifies.
         """
+        try:
+            return self._append(payload_dict)
+        except ConcurrencyError as exc:
+            if exc.reason is Reason.LEASE_EXPIRED:
+                # The rejected append rolls back. Persist expiry in its own
+                # transaction so a failed worker write cannot erase the audit.
+                with self._write() as conn:
+                    self._expire_due_leases(conn, payload_dict["proof_id"], self._clock_ns())
+            raise
+
+    def _append(self, payload_dict: dict[str, Any]) -> tuple[int, str]:
         proof_id = payload_dict["proof_id"]
+        if not payload_dict.get("ops"):
+            raise ConcurrencyError(
+                Reason.EMPTY_PROPOSAL, "proposal carries no graph mutations"
+            )
         base_revision = payload_dict.get("base_revision")
         lease_id = payload_dict.get("lease_id")
         fencing_token = payload_dict.get("fencing_token")
 
-        try:
-            with self._write() as conn:
-                row = self._head_row(proof_id)
-                if row is None:
-                    head_revision, head_hash = 0, GENESIS_HASH
-                else:
-                    self._verify_row(row)
-                    head_revision, head_hash = row["revision"], row["event_hash"]
+        with self._write() as conn:
+            row = self._head_row(proof_id)
+            if row is None:
+                head_revision, head_hash = 0, GENESIS_HASH
+            else:
+                self._verify_row(row)
+                head_revision, head_hash = row["revision"], row["event_hash"]
 
-                if base_revision is not None and base_revision != head_revision:
-                    raise ConcurrencyError(
-                        Reason.STALE_BASE_REVISION,
-                        f"proposal is based on revision {base_revision}, head is {head_revision}",
-                    )
-
-                if lease_id is not None or fencing_token is not None:
-                    self._check_lease(conn, proof_id, lease_id, fencing_token)
-
-                revision = head_revision + 1
-                event_hash = chain_hash(head_hash, payload_dict)
-                conn.execute(
-                    """
-                    INSERT INTO journal (
-                        proof_id, revision, event_hash, prev_hash,
-                        actor, worker_class, payload
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        proof_id,
-                        revision,
-                        event_hash,
-                        head_hash,
-                        payload_dict["actor"],
-                        payload_dict["worker_class"],
-                        canonical_json(payload_dict).decode("utf-8"),
-                    ),
+            if base_revision is not None and base_revision != head_revision:
+                raise ConcurrencyError(
+                    Reason.STALE_BASE_REVISION,
+                    f"proposal is based on revision {base_revision}, head is {head_revision}",
                 )
-        except ConcurrencyError as exc:
-            if exc.reason is Reason.LEASE_NOT_HELD:
-                # The refused append rolled back, taking the lazy lapse of the
-                # dead lease with it. Re-lapse in its own transaction so the
-                # expiry stays audited (Invariant 10).
-                with self._write() as conn:
-                    self._expire_due_leases(conn, proof_id)
-            raise
+
+            if lease_id is not None or fencing_token is not None:
+                self._check_lease(
+                    conn, proof_id, lease_id, fencing_token,
+                    payload_dict.get("actor"), payload_dict.get("worker_class"),
+                    self._clock_ns(),
+                )
+
+            revision = head_revision + 1
+            event_hash = chain_hash(head_hash, payload_dict)
+            conn.execute(
+                """
+                INSERT INTO journal (
+                    proof_id, revision, event_hash, prev_hash,
+                    actor, worker_class, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proof_id,
+                    revision,
+                    event_hash,
+                    head_hash,
+                    payload_dict["actor"],
+                    payload_dict["worker_class"],
+                    canonical_json(payload_dict).decode("utf-8"),
+                ),
+            )
         return revision, event_hash
 
+    @staticmethod
     def _check_lease(
-        self,
         conn: sqlite3.Connection,
         proof_id: str,
         lease_id: str | None,
         fencing_token: int | None,
+        actor: str | None,
+        worker_class: str | None,
+        now_ns: int,
     ) -> None:
-        """Confirm the proposer holds an active, unexpired lease on this proof.
-
-        Any live dispatch lease counts -- distinct moves may be leased
-        concurrently -- but a lapsed, released, or superseded row is dead
-        forever, and a token that does not match its lease is superseded.
-        """
-        self._expire_due_leases(conn, proof_id)
+        """Confirm a live token belongs to the trusted worker identity."""
         row = conn.execute(
             "SELECT * FROM leases WHERE proof_id = ? AND lease_id = ?",
             (proof_id, lease_id),
         ).fetchone()
         if row is None:
             raise ConcurrencyError(
-                Reason.LEASE_NOT_HELD, f"no lease {lease_id!r} is held on {proof_id!r}"
+                Reason.LEASE_NOT_HELD, f"no lease is held on {proof_id!r}"
+            )
+        if type(fencing_token) is not int or row["fencing_token"] != fencing_token:
+            raise ConcurrencyError(
+                Reason.FENCING_TOKEN_SUPERSEDED,
+                f"fencing token {fencing_token!r} is superseded by {row['fencing_token']!r}",
+            )
+        if row["actor"] != actor or row["worker_class"] != worker_class:
+            raise ConcurrencyError(
+                Reason.LEASE_IDENTITY_MISMATCH,
+                "proposal actor and worker class do not match the lease holder",
+            )
+        if row["expires_at_ns"] is None or now_ns >= row["expires_at_ns"]:
+            raise ConcurrencyError(
+                Reason.LEASE_EXPIRED, f"lease {lease_id!r} has expired"
             )
         if row["status"] != "active":
             raise ConcurrencyError(
                 Reason.LEASE_NOT_HELD,
-                f"lease {lease_id!r} on {proof_id!r} is {row['status']}, not active",
-            )
-        if row["fencing_token"] != fencing_token:
-            raise ConcurrencyError(
-                Reason.FENCING_TOKEN_SUPERSEDED,
-                f"fencing token {fencing_token!r} is superseded by {row['fencing_token']!r}",
+                f"lease {lease_id!r} is {row['status']}, not active",
             )
 
     def read_events(self, proof_id: str) -> Sequence[dict[str, Any]]:
@@ -647,6 +609,24 @@ class JournalStore:
             "SELECT payload FROM journal WHERE proof_id = ? ORDER BY revision ASC",
             (proof_id,),
         ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def read_events_between(
+        self, proof_id: str, after_revision: int, through_revision: int
+    ) -> Sequence[dict[str, Any]]:
+        """Events needed to bring a projection through a specific journal head."""
+        rows = self._conn.execute(
+            "SELECT revision, payload FROM journal WHERE proof_id = ? AND revision > ? "
+            "AND revision <= ? ORDER BY revision",
+            (proof_id, after_revision, through_revision),
+        ).fetchall()
+        expected = list(range(after_revision + 1, through_revision + 1))
+        if [row["revision"] for row in rows] != expected:
+            raise ConcurrencyError(
+                Reason.READ_VIEW_OUT_OF_SYNC,
+                f"journal cannot supply revisions {after_revision + 1}..{through_revision} "
+                f"for proof {proof_id!r}",
+            )
         return [json.loads(row["payload"]) for row in rows]
 
     def record_rejection(
