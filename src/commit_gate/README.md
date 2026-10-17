@@ -41,3 +41,31 @@ The `commit_gate` module contains the following files:
 - **`apply.py`**: An engine that idempotently projects a sequence of operations onto a `MemoryView`. Used for local testing and replay.
 - **`store.py`**: An append-only SQLite journal. Every mutation runs in one `BEGIN IMMEDIATE` transaction, so the head read, the base-revision check, the lease-fencing and expiry checks, and the insert cannot interleave with another writer. Leases expire after 300 seconds by default; acquisitions are recorded in `lease_audit` outside the hash chain. A writer that cannot take the lock within `busy_timeout_ms` gets a `journal-busy` rejection rather than a raw SQLite error. `verify_chain(proof_id)` recomputes every hash in a proof's history and raises `HashChainError` on the first row that does not chain; `append` runs the same check on the head alone, so a corrupt hash never gets a valid link built on top of it. Only the gate may call its mutating methods.
 - **`gate.py`**: The `CommitGate` orchestrator, and the system's **sole writer**. It receives proposals, runs all validators via `validate.py`, and if accepted, chains and appends the event to the journal itself. A lost race (stale base revision, superseded fencing token) comes back as a `Rejection`, not an exception.
+
+## Dispatch leases
+
+The trusted scheduler calls `issue_lease(proof_id, lease_id, actor=..., worker_class=...,
+selected_move_id=..., ttl_seconds=600)` to assign a move. It returns a `LeaseRow`
+with the fencing token and current base revision. The worker's `Proposal` must
+carry that lease ID, token, actor, worker class, and `selected_move_id`. A token
+cannot be used for another worker or another declared move. Operation authority
+continues to be checked by the existing gate validators.
+
+Distinct moves may hold leases concurrently; reissuing the same move supersedes
+its old lease. `acquire_lease` retains its existing API for an exclusive proof
+lease with a 300 second default TTL. It supersedes active dispatch leases and
+blocks new dispatches until it is released or expires. Both APIs require a
+finite TTL between 0 and 86400 seconds, exclusive of 0.
+
+After work finishes, the scheduler calls
+`release_lease(proof_id, lease_id, fencing_token=...)`. Releasing an old generation
+cannot cancel a renewal. A successful commit does not itself release a lease.
+A still-live lease also does not bypass revision checks: after another worker
+commits, the proposal must be revalidated against the new revision.
+
+`active_leases` and commit checks detect expiry when called; expiry does not use
+a background timer. `read_lease_events` exposes issuance, supersession, expiry,
+and release from `lease_audit`. These operations never advance proof revisions
+or the hash chain. Existing lease rows and audit history are migrated atomically,
+including the highest fencing token; legacy leases without a bound holder or
+expiry remain unusable.
