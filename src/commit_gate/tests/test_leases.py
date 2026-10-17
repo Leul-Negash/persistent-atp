@@ -92,6 +92,7 @@ class TestDispatchLeases(unittest.TestCase):
                 base_revision=first.base_revision,
                 lease_id=first.lease_id,
                 fencing_token=first.fencing_token,
+                selected_move_id=first.selected_move_id,
             )
         )
         result_two = gate.commit(
@@ -107,12 +108,36 @@ class TestDispatchLeases(unittest.TestCase):
                 base_revision=result_one.revision,
                 lease_id=second.lease_id,
                 fencing_token=second.fencing_token,
+                selected_move_id=second.selected_move_id,
             )
         )
 
         self.assertTrue(result_one.accepted, result_one.rejections)
         self.assertTrue(result_two.accepted, result_two.rejections)
         self.assertEqual(self.store.verify_chain("p1"), 2)
+
+    def test_dispatch_proposal_round_trips_its_move(self):
+        lease = self.issue("ls-1", "p1/rm-1")
+        proposal = self.proposal(lease)
+        self.assertEqual(Proposal.from_dict(proposal.to_dict()), proposal)
+
+    def test_dispatch_token_is_bound_to_actor_class_and_move(self):
+        lease = self.issue("ls-1", "p1/rm-1")
+        gate = CommitGate(self._seeded_view(), self.store)
+        cases = (
+            ({"actor": "another-worker"}, Reason.LEASE_IDENTITY_MISMATCH),
+            ({"worker_class": "coordinator"}, Reason.LEASE_IDENTITY_MISMATCH),
+            ({"selected_move_id": None}, Reason.LEASE_MOVE_MISMATCH),
+            ({"selected_move_id": "p1/rm-2"}, Reason.LEASE_MOVE_MISMATCH),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                result = gate.commit(self.proposal(lease, **overrides))
+                self.assertFalse(result.accepted)
+                self.assertEqual(result.rejections[0].reason, expected)
+                self.assertEqual(self.store.head("p1"), (0, GENESIS_HASH))
+        self.assertTrue(gate.commit(self.proposal(lease)).accepted)
+        self.assertEqual(self.store.read_events("p1")[0]["selected_move_id"], "p1/rm-1")
 
     def test_live_lease_does_not_bypass_revision_check(self):
         first = self.issue("ls-1", "p1/rm-1")
@@ -210,6 +235,7 @@ class TestDispatchLeases(unittest.TestCase):
         gate = CommitGate(self._seeded_view(), self.store)
         result = gate.commit(claim_status_proposal(
             "p1/c-1", lease_id=lease.lease_id, fencing_token=lease.fencing_token,
+            selected_move_id=lease.selected_move_id,
         ))
         self.assertFalse(result.accepted)
         self.assertEqual(result.rejections[0].reason, Reason.LEASE_NOT_HELD)
@@ -268,7 +294,7 @@ class TestDispatchLeases(unittest.TestCase):
         fields = dict(
             actor=lease.actor, worker_class=lease.worker_class,
             lease_id=lease.lease_id, fencing_token=lease.fencing_token,
-            base_revision=lease.base_revision,
+            base_revision=lease.base_revision, selected_move_id=lease.selected_move_id,
         )
         fields.update(overrides)
         return claim_status_proposal("p1/c-1", **fields)

@@ -211,6 +211,7 @@ class TestContendedLeases(ContentionCase):
             lease = leases[index]
             return CommitGate(MemoryView(), self.store()).commit(proposal(
                 index, lease_id=lease.lease_id, fencing_token=lease.fencing_token,
+                selected_move_id=lease.selected_move_id,
             ))
 
         results = self.run_threads(commit)
@@ -282,6 +283,7 @@ class TestContendedGate(ContentionCase):
             lease = leases[index]
             return gate.commit(proposal(
                 index, lease_id=lease.lease_id, fencing_token=lease.fencing_token,
+                selected_move_id=lease.selected_move_id,
             ))
 
         results = self.run_threads(attempt)

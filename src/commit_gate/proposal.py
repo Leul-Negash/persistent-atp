@@ -29,9 +29,10 @@ class Proposal:
     base_revision: int | None = None
     lease_id: str | None = None
     fencing_token: int | None = None
+    selected_move_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "proof_id": self.proof_id,
             "actor": self.actor,
             "worker_class": str(self.worker_class),
@@ -40,6 +41,9 @@ class Proposal:
             "fencing_token": self.fencing_token,
             "ops": [op.to_dict() for op in self.ops],
         }
+        if self.selected_move_id is not None:
+            payload["selected_move_id"] = self.selected_move_id
+        return payload
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Proposal":
@@ -52,4 +56,5 @@ class Proposal:
             base_revision=raw.get("base_revision"),
             lease_id=raw.get("lease_id"),
             fencing_token=raw.get("fencing_token"),
+            selected_move_id=raw.get("selected_move_id"),
         )

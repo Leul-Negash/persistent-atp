@@ -300,7 +300,7 @@ class JournalStore:
         """Dispatch one move; distinct moves may hold leases concurrently.
 
         Reissuing a move renews ownership with a new token. The trusted
-        scheduler binds the worker identity to the assigned lease.
+        scheduler binds the worker identity; proposals must name this move.
         """
         worker_class = self._validate_holder(actor, worker_class, ttl_seconds)
         if (
@@ -540,7 +540,7 @@ class JournalStore:
                 self._check_lease(
                     conn, proof_id, lease_id, fencing_token,
                     payload_dict.get("actor"), payload_dict.get("worker_class"),
-                    self._clock_ns(),
+                    self._clock_ns(), payload_dict.get("selected_move_id"),
                 )
 
             revision = head_revision + 1
@@ -573,8 +573,9 @@ class JournalStore:
         actor: str | None,
         worker_class: str | None,
         now_ns: int,
+        selected_move_id: str | None,
     ) -> None:
-        """Confirm a live token belongs to the trusted worker identity."""
+        """Bind a live token to its worker and, for dispatches, its move."""
         row = conn.execute(
             "SELECT * FROM leases WHERE proof_id = ? AND lease_id = ?",
             (proof_id, lease_id),
@@ -592,6 +593,10 @@ class JournalStore:
             raise ConcurrencyError(
                 Reason.LEASE_IDENTITY_MISMATCH,
                 "proposal actor and worker class do not match the lease holder",
+            )
+        if row["selected_move_id"] is not None and row["selected_move_id"] != selected_move_id:
+            raise ConcurrencyError(
+                Reason.LEASE_MOVE_MISMATCH, "proposal move does not match the leased move"
             )
         if row["expires_at_ns"] is None or now_ns >= row["expires_at_ns"]:
             raise ConcurrencyError(
