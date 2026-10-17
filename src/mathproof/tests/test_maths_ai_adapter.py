@@ -1,9 +1,10 @@
 """MathsAIFormalATP: hybrid-reasoner results mapped onto the formal seam."""
 
 import unittest
+from unittest.mock import patch
 
 from commit_gate.vocab import RunDisposition
-from mathproof.formal_atp import FormalATPAdapter
+from mathproof.formal_atp import FormalATPAdapter, _digest
 from mathproof.maths_ai_atp import MathsAIFormalATP
 from mathproof.schemas import validate
 from mathproof.soundness import validate_formal_search_result
@@ -156,6 +157,73 @@ def mid_graph_fallback_branch():
     )
 
 
+def fallback_descendant_graph():
+    root = StubNode(0, StubGoal(REQUEST["goal_text"]), "solved")
+    child = StubNode(1, StubGoal("unproved child"), "solved")
+    return StubGraph(
+        [root, child],
+        [
+            StubEdge(0, StubTactic("constructor"), [1], status="solved"),
+            StubEdge(1, StubTactic("PLN_fallback"), [], status="solved"),
+        ],
+        solved=True,
+        trace={"goal": REQUEST["goal_text"], "tactic": "constructor", "subgoals": [
+            {"goal": "unproved child", "tactic": "PLN_fallback", "subgoals": []}
+        ]},
+    )
+
+
+def kernel_closed_children_graph():
+    root = StubNode(0, StubGoal(REQUEST["goal_text"]), "solved")
+    left = StubNode(1, StubGoal("left goal"), "solved")
+    right = StubNode(2, StubGoal("right goal"), "solved")
+    return StubGraph(
+        [root, left, right],
+        [
+            StubEdge(0, StubTactic("constructor"), [1, 2], status="solved"),
+            StubEdge(1, StubTactic("exact"), [], status="solved"),
+            StubEdge(2, StubTactic("simp"), [], status="solved"),
+        ],
+        solved=True,
+    )
+
+
+def cyclic_solved_graph():
+    root = StubNode(0, StubGoal(REQUEST["goal_text"]), "solved")
+    child = StubNode(1, StubGoal("cyclic child"), "solved")
+    return StubGraph(
+        [root, child],
+        [
+            StubEdge(0, StubTactic("intro"), [1], status="solved"),
+            StubEdge(1, StubTactic("apply"), [0], status="solved"),
+        ],
+        solved=True,
+    )
+
+
+def cyclic_edge_with_valid_alternative_graph():
+    root = StubNode(0, StubGoal(REQUEST["goal_text"]), "solved")
+    child = StubNode(1, StubGoal("cyclic child"), "solved")
+    return StubGraph(
+        [root, child],
+        [
+            StubEdge(0, StubTactic("apply"), [1], status="solved"),
+            StubEdge(1, StubTactic("apply"), [0], status="solved"),
+            StubEdge(0, StubTactic("exact"), [], status="solved"),
+        ],
+        solved=True,
+    )
+
+
+def duplicate_child_graph():
+    root = StubNode(0, StubGoal(REQUEST["goal_text"]), "expanded")
+    child = StubNode(1, StubGoal("child"), "open")
+    return StubGraph(
+        [root, child],
+        [StubEdge(0, StubTactic("constructor"), [1, 1], status="pending")],
+    )
+
+
 class TestMathsAIFormalATP(unittest.TestCase):
     def test_satisfies_the_adapter_protocol(self):
         self.assertIsInstance(MathsAIFormalATP(reasoner=StubReasoner()), FormalATPAdapter)
@@ -241,6 +309,80 @@ class TestMathsAIFormalATP(unittest.TestCase):
         by_label = {e["tactic_label"]: e for e in result["tactic_edges"]}
         self.assertEqual(by_label["exact"]["executor_result"], "lean-accepted")
         self.assertEqual(by_label["PLN_fallback"]["executor_result"], "empty-output")
+
+    def test_certificate_uses_kernel_trace_even_if_reasoner_prefers_fallback(self):
+        graph = mixed_root_graph()
+        graph._trace = {"goal": REQUEST["goal_text"], "tactic": "PLN_fallback", "subgoals": []}
+        result = MathsAIFormalATP(reasoner=StubReasoner(graph)).formal_search_start(REQUEST)
+        kernel_trace = {
+            "goal": REQUEST["goal_text"], "tactic": "exact",
+            "arguments": ["Or.comm"], "subgoals": [],
+        }
+        self.assertEqual(result["certificate"]["artifact_hash"], _digest(
+            "certificate", REQUEST["run_id"], kernel_trace
+        ))
+
+    def test_fallback_closed_descendant_keeps_root_open_and_uncertified(self):
+        result = MathsAIFormalATP(reasoner=StubReasoner(fallback_descendant_graph())).formal_search_start(REQUEST)
+        self.assertEqual(result["disposition"], RunDisposition.BUDGET_EXHAUSTED.value)
+        self.assertNotIn("certificate", result)
+        self.assertEqual({state["status"] for state in result["states"]}, {"open"})
+        self.assertEqual(set(result["checkpoint"]["frontier_state_ids"]), {"p1/fs-1", "p1/fs-2"})
+
+    def test_all_lean_closed_children_allow_certificate(self):
+        result = MathsAIFormalATP(reasoner=StubReasoner(kernel_closed_children_graph())).formal_search_start(REQUEST)
+        self.assertEqual(result["disposition"], RunDisposition.PROVED_PENDING_REPLAY.value)
+        self.assertIn("certificate", result)
+        self.assertEqual(validate_formal_search_result(result), ())
+        self.assertEqual({state["status"] for state in result["states"]}, {"formally-closed"})
+
+    def test_cyclic_claim_of_closure_is_not_certified(self):
+        result = MathsAIFormalATP(reasoner=StubReasoner(cyclic_solved_graph())).formal_search_start(REQUEST)
+        self.assertEqual(result["disposition"], RunDisposition.BUDGET_EXHAUSTED.value)
+        self.assertNotIn("certificate", result)
+
+    def test_cyclic_edge_is_skipped_for_valid_lean_alternative(self):
+        result = MathsAIFormalATP(
+            reasoner=StubReasoner(cyclic_edge_with_valid_alternative_graph())
+        ).formal_search_start(REQUEST)
+        self.assertEqual(result["disposition"], RunDisposition.PROVED_PENDING_REPLAY.value)
+        self.assertEqual(result["certificate"]["artifact_hash"], _digest(
+            "certificate", REQUEST["run_id"], {
+                "goal": REQUEST["goal_text"], "tactic": "exact",
+                "arguments": [], "subgoals": [],
+            }
+        ))
+
+    def test_missing_child_fails_closed(self):
+        graph = solved_graph()
+        graph.edges[1].child_ids = [99]
+        result = MathsAIFormalATP(reasoner=StubReasoner(graph)).formal_search_start(REQUEST)
+        self.assertEqual(result["disposition"], RunDisposition.INTERNAL_ERROR.value)
+        self.assertNotIn("certificate", result)
+
+    def test_invalid_result_is_screened_on_start_and_resume(self):
+        atp = MathsAIFormalATP(reasoner=StubReasoner(
+            duplicate_child_graph(), duplicate_child_graph()
+        ))
+        for result in (
+            atp.formal_search_start(REQUEST),
+            atp.formal_search_resume(REQUEST["run_id"]),
+        ):
+            self.assertEqual(result["disposition"], RunDisposition.INTERNAL_ERROR.value)
+            self.assertNotIn("certificate", result)
+            self.assertIn("duplicated-subgoal", result["artifacts"][0]["note"])
+
+    def test_schema_invalid_result_fails_closed(self):
+        with patch("mathproof.maths_ai_atp._convert_graph", return_value={
+            "run_id": REQUEST["run_id"], "proof_id": REQUEST["proof_id"],
+            "disposition": "proved-pending-replay", "certificate": {
+                "artifact_hash": "sha256:" + "18" * 32, "status": "candidate",
+            },
+        }):
+            result = MathsAIFormalATP(reasoner=StubReasoner(solved_graph())).formal_search_start(REQUEST)
+        self.assertEqual(result["disposition"], RunDisposition.INTERNAL_ERROR.value)
+        self.assertNotIn("certificate", result)
+        self.assertIn("environment_hash", result["artifacts"][0]["note"])
 
     def test_fallback_closed_side_branch_stays_open(self):
         result = dict(

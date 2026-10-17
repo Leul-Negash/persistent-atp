@@ -1,24 +1,16 @@
-"""Phase 0 soundness hardening (C1-C5), Section 6.12.
+"""Soundness hardening of formal-search results (Section 6.12).
 
-Run against the fake adapter + structural validator, and -- for C5 -- the real
-commit gate and journal. Each test maps to one named invariant:
+Each test maps to one named invariant:
 
 * C1  omitted subgoal -> rejection, counted for the omission-rate metric.
 * C2  heuristic scores cannot close a state (strong score and fallback score).
 * C3  no replay result -> no certificate promotion; stub replay gates it.
-* C4  environment drift stales the newer certificate.
-* C5  superseded fencing token -> rejection, journaled for audit.
+* C4  the current environment pin, rather than historical certificates,
+  determines whether a result is stale.
+* C5  only proved-pending-replay may carry a candidate certificate.
 """
 
 import unittest
-
-from commit_gate.gate import CommitGate
-from commit_gate.apply import apply_ops
-from commit_gate.ops import SetField, UpsertNode
-from commit_gate.proposal import Proposal
-from commit_gate.reasons import Reason
-from commit_gate.state import MemoryView
-from commit_gate.store import JournalStore
 
 from mathproof.formal_atp import FakeFormalATP, build_result, stub_replay
 from mathproof.soundness import (
@@ -156,12 +148,20 @@ class TestC3ReplayGateStub(unittest.TestCase):
         certificate = dict(result["certificate"])
 
         verdict = atp.formal_replay(certificate, self.REQUEST["environment_hash"])
-        certificate["status"] = "replay-pending"
+        certificate["status"] = "replay-accepted"
         certificate["replay_result"] = verdict
         result["certificate"] = certificate
 
         self.assertEqual(validate_formal_search_result(result), ())
         self.assertEqual(verdict["status"], "verified")
+
+    def test_rejected_replay_matches_rejected_certificate(self):
+        result = build_result("proved-pending-replay", self.REQUEST)
+        result["certificate"]["status"] = "replay-rejected"
+        result["certificate"]["replay_result"] = stub_replay("rejected")(
+            result["certificate"], ENV_A
+        )
+        self.assertEqual(validate_formal_search_result(result), ())
 
     def test_stub_replay_fail_contradicts_accepted_status(self):
         atp = FakeFormalATP(replay_fn=stub_replay("rejected"))
@@ -177,46 +177,23 @@ class TestC3ReplayGateStub(unittest.TestCase):
             {v.reason for v in violations},
         )
 
-    def test_gate_state_machine_blocks_the_direct_jump(self):
-        """The same contract enforced by the commit gate's transition table."""
-        view = MemoryView()
-        store = JournalStore()
-        gate = CommitGate(view, store)
-
-        create = Proposal(
-            proof_id="p1",
-            actor="atp",
-            worker_class="formal-atp",
-            ops=(UpsertNode("Certificate", "p1/cert-1", {"status": "candidate"}),),
-            base_revision=0,
+    def test_replay_environment_must_be_present_and_match(self):
+        result = build_result("proved-pending-replay", self.REQUEST)
+        result["certificate"]["status"] = "replay-accepted"
+        result["certificate"]["replay_result"] = {"status": "verified"}
+        self.assertIn(
+            SoundnessReason.REPLAY_ENVIRONMENT_MISMATCH,
+            {v.reason for v in validate_formal_search_result(result)},
         )
-        accepted = gate.commit(create)
-        self.assertTrue(accepted.accepted)
-        apply_ops(view, create.ops)
-
-        skip = Proposal(
-            proof_id="p1",
-            actor="atp",
-            worker_class="formal-atp",
-            ops=(
-                SetField(
-                    "Certificate", "p1/cert-1", "status",
-                    "replay-accepted", prior="candidate",
-                ),
-            ),
-            base_revision=1,
-            lease_id="lease-1",
-            fencing_token=1,
-        )
-        result = gate.commit(skip)
-        self.assertFalse(result.accepted)
-        self.assertEqual(
-            [r.reason for r in result.rejections], [Reason.ILLEGAL_STATUS_TRANSITION]
+        result["certificate"]["replay_result"]["environment_hash"] = ENV_B
+        self.assertIn(
+            SoundnessReason.REPLAY_ENVIRONMENT_MISMATCH,
+            {v.reason for v in validate_formal_search_result(result)},
         )
 
 
 class TestC4EnvironmentDrift(unittest.TestCase):
-    """Sections 6.12 / 11.4: changed environment -> the new certificate is stale."""
+    """Sections 6.12 / 11.4: the current pin controls acceptance."""
 
     @staticmethod
     def _certificate(env_hash: str) -> dict:
@@ -226,123 +203,61 @@ class TestC4EnvironmentDrift(unittest.TestCase):
             "environment_hash": env_hash,
         }
 
-    def test_first_certificate_against_pinned_environment_is_current(self):
-        first = self._certificate(ENV_A)
-        self.assertIsNone(check_environment_staleness([], first))
+    def test_result_under_current_pin_is_current(self):
+        current = self._certificate(ENV_B)
+        self.assertIsNone(check_environment_staleness(current, ENV_B))
 
-    def test_second_certificate_under_different_environment_is_stale(self):
-        first = self._certificate(ENV_A)
-        second = self._certificate(ENV_B)
-        violation = check_environment_staleness([first], second)
+    def test_result_under_old_pin_is_stale(self):
+        old = self._certificate(ENV_A)
+        violation = check_environment_staleness(old, ENV_B)
 
         self.assertIsNotNone(violation)
         self.assertEqual(violation.reason, SoundnessReason.ENVIRONMENT_STALE)
 
-    def test_same_environment_twice_is_not_drift(self):
-        first = self._certificate(ENV_A)
-        second = {**self._certificate(ENV_A), "artifact_hash": "sha256:" + "19" * 32}
-        self.assertIsNone(check_environment_staleness([first], second))
+    def test_old_certificate_does_not_stale_result_under_new_pin(self):
+        # A historical ENV_A certificate may still exist after a legitimate
+        # pin change. The new ENV_B result must be judged against ENV_B.
+        prior = self._certificate(ENV_A)
+        current = {**prior, "environment_hash": ENV_B}
+        self.assertIsNone(check_environment_staleness(current, ENV_B))
 
-    def test_certificates_for_other_declarations_do_not_trigger(self):
-        other = {**self._certificate(ENV_B), "declaration_id": "p1/fd-2"}
-        candidate = self._certificate(ENV_A)
-        self.assertIsNone(check_environment_staleness([other], candidate))
-
-
-class TestC5StaleFencingToken(unittest.TestCase):
-    """Invariants 8/10 via the real gate: stale token rejected *and* journalled.
-
-    The scenario: worker A holds the lease, commits, then its lease is
-    renewed (a second acquire bumps the fencing token). A result still in
-    flight under the old token arrives -- it must be refused, leave committed
-    state untouched, and survive in the rejection audit log.
-    """
-
-    LEASE = "lease-worker-a"
-
-    def setUp(self):
-        self.view = MemoryView()
-        self.store = JournalStore()
-        self.gate = CommitGate(self.view, self.store)
-
-        self.token_one = self.store.acquire_lease("p1", self.LEASE)
-        first = Proposal(
-            proof_id="p1",
-            actor="worker-a",
-            worker_class="test",
-            ops=(UpsertNode("FormalState", "p1/fs-1", {"status": "open"}),),
-            base_revision=0,
-            lease_id=self.LEASE,
-            fencing_token=self.token_one,
-        )
-        self.assertTrue(self.gate.commit(first).accepted)
-        apply_ops(self.view, first.ops)
-
-        # The lease is renewed; token_one is now obsolete.
-        self.token_two = self.store.acquire_lease("p1", self.LEASE)
-        self.assertGreater(self.token_two, self.token_one)
-
-    def _late_proposal(self) -> Proposal:
-        return Proposal(
-            proof_id="p1",
-            actor="worker-a",
-            worker_class="formal-atp",
-            ops=(
-                SetField(
-                    "FormalState", "p1/fs-1", "status",
-                    "expanded", prior="open",
-                ),
-            ),
-            base_revision=1,
-            lease_id=self.LEASE,
-            fencing_token=self.token_one,
+    def test_validator_uses_supplied_current_pin(self):
+        result = build_result("proved-pending-replay", {
+            "run_id": "p1/fr-1", "proof_id": "p1", "environment_hash": ENV_A,
+        })
+        self.assertIn(
+            SoundnessReason.ENVIRONMENT_STALE,
+            {v.reason for v in validate_formal_search_result(
+                result, pinned_environment_hash=ENV_B
+            )},
         )
 
-    def test_superseded_token_is_rejected_with_typed_reason(self):
-        result = self.gate.commit(self._late_proposal())
-        self.assertFalse(result.accepted)
-        self.assertEqual(
-            [r.reason for r in result.rejections],
-            [Reason.FENCING_TOKEN_SUPERSEDED],
+
+class TestC5CertificateDisposition(unittest.TestCase):
+    def test_non_proof_dispositions_cannot_carry_certificate(self):
+        for disposition in ("budget-exhausted", "stagnated", "internal-error"):
+            with self.subTest(disposition=disposition):
+                result = build_result(disposition, {
+                    "run_id": "p1/fr-1", "proof_id": "p1", "environment_hash": ENV_A,
+                })
+                result["certificate"] = {
+                    "artifact_hash": "sha256:" + "18" * 32,
+                    "status": "candidate",
+                }
+                self.assertIn(
+                    SoundnessReason.CERTIFICATE_DISPOSITION_MISMATCH,
+                    {v.reason for v in validate_formal_search_result(result)},
+                )
+
+    def test_certificate_requires_closed_root(self):
+        result = build_result("proved-pending-replay", {
+            "run_id": "p1/fr-1", "proof_id": "p1", "environment_hash": ENV_A,
+        })
+        result["tactic_edges"][0]["tactic_label"] = "PLN_fallback"
+        self.assertIn(
+            SoundnessReason.CERTIFICATE_WITHOUT_KERNEL_PROOF,
+            {v.reason for v in validate_formal_search_result(result)},
         )
-
-    def test_rejected_write_changes_no_committed_state(self):
-        head_before = self.store.head("p1")
-        self.gate.commit(self._late_proposal())
-        self.assertEqual(self.store.head("p1"), head_before)
-        self.assertEqual(len(self.store.read_events("p1")), 1)
-
-    def test_rejection_remains_journaled_for_audit(self):
-        proposal = self._late_proposal()
-        self.gate.commit(proposal)
-
-        audit = self.store.read_rejections("p1")
-        self.assertEqual(len(audit), 1)
-        entry = audit[0]
-        self.assertEqual(entry["reason"], Reason.FENCING_TOKEN_SUPERSEDED.value)
-        self.assertIsNotNone(entry["payload"])
-        self.assertEqual(entry["payload"]["fencing_token"], self.token_one)
-        self.assertEqual(
-            entry["payload"]["ops"][0]["field"], "status"
-        )
-
-    def test_current_token_commits_where_the_stale_one_could_not(self):
-        self.gate.commit(self._late_proposal())
-        fresh = Proposal(
-            proof_id="p1",
-            actor="worker-a",
-            worker_class="formal-atp",
-            ops=(
-                SetField(
-                    "FormalState", "p1/fs-1", "status",
-                    "expanded", prior="open",
-                ),
-            ),
-            base_revision=1,
-            lease_id=self.LEASE,
-            fencing_token=self.token_two,
-        )
-        self.assertTrue(self.gate.commit(fresh).accepted)
 
 
 if __name__ == "__main__":

@@ -6,9 +6,8 @@ adapter output -- typically the fake adapter's:
 * **Child-count completeness** (Invariant 2): a tactic's declared subgoal
   count, its produced-goal list, and the states actually reported must all
   agree. One missing child rejects the whole result.
-* **Score/status separation** (Invariant 3): only a Lean-accepted,
-  zero-goal transition may mark a state closed; heuristic annotations never
-  establish truth.
+* **Score/status separation** (Invariant 3): a state closes only when a
+  Lean-accepted tactic has every child recursively closed by Lean.
 * **Environment-hash presence**: the run and every obstruction identify the
   pinned environment, so Phase 1's replay gating has something to bind to.
 
@@ -66,6 +65,8 @@ class SoundnessReason(StrEnum):
     OBSTRUCTION_ENVIRONMENT_MISMATCH = "obstruction-environment-mismatch"
 
     CERTIFICATE_REQUIRED = "certificate-required"
+    CERTIFICATE_DISPOSITION_MISMATCH = "certificate-disposition-mismatch"
+    CERTIFICATE_WITHOUT_KERNEL_PROOF = "certificate-without-kernel-proof"
     PROMOTION_WITHOUT_REPLAY = "promotion-without-replay"
     REPLAY_ENVIRONMENT_MISMATCH = "replay-environment-mismatch"
     ENVIRONMENT_STALE = "environment-stale"
@@ -132,10 +133,10 @@ def _check_tactic_edges(result: Mapping[str, Any]) -> Iterable[tuple[SoundnessVi
     for index, edge in enumerate(result.get("tactic_edges") or []):
         pointer = f"tactic_edges[{index}]"
         declared = edge.get("subgoal_count")
-        children = edge.get("produced_goal_ids") or []
+        children = edge.get("produced_goal_ids")
         tactic_id = edge.get("tactic_id", "<missing>")
 
-        if declared is None or not isinstance(declared, int):
+        if type(declared) is not int or declared < 0:
             yield (
                 SoundnessViolation(
                     SoundnessReason.SUBGOAL_COUNT_MISMATCH,
@@ -146,19 +147,19 @@ def _check_tactic_edges(result: Mapping[str, Any]) -> Iterable[tuple[SoundnessVi
             )
             continue
 
-        if len(children) != declared:
+        if not isinstance(children, list) or len(children) != declared:
             yield (
                 SoundnessViolation(
                     SoundnessReason.OMITTED_SUBGOAL,
                     f"tactic {tactic_id!r} declares {declared} Lean-produced "
-                    f"goal(s) but lists {len(children)}",
+                    f"goal(s) but lists {len(children) if isinstance(children, list) else 'no list'}",
                     pointer,
                 ),
                 edge,
             )
             continue
 
-        duplicated = {c for c in children if children.count(c) > 1}
+        duplicated = {c for c in children if isinstance(c, str) and children.count(c) > 1}
         if duplicated:
             yield (
                 SoundnessViolation(
@@ -170,7 +171,7 @@ def _check_tactic_edges(result: Mapping[str, Any]) -> Iterable[tuple[SoundnessVi
             )
             continue
 
-        unknown = [c for c in children if c not in states]
+        unknown = [c for c in children if not isinstance(c, str) or c not in states]
         if unknown:
             # Invariant 2: a listed obligation with no state behind it is as
             # lost as one that was never listed.
@@ -206,15 +207,52 @@ def _check_tactic_edges(result: Mapping[str, Any]) -> Iterable[tuple[SoundnessVi
         yield (None, edge)
 
 
-def _check_closure_and_scores(result: Mapping[str, Any]) -> Iterable[SoundnessViolation]:
-    """A state closes only through a Lean-accepted zero-goal transition."""
-    closing: dict[str, str] = {}
+def _kernel_closed_states(result: Mapping[str, Any]) -> set[str]:
+    """Find states with a complete, acyclic Lean-only AND/OR proof."""
+    state_ids = {
+        state.get("state_id")
+        for state in result.get("states") or []
+        if isinstance(state.get("state_id"), str)
+    }
+    outgoing: dict[str, list[Mapping[str, Any]]] = {}
     for edge in result.get("tactic_edges") or []:
+        children = edge.get("produced_goal_ids")
         if (
-            edge.get("executor_result") == "lean-accepted"
-            and edge.get("subgoal_count") == 0
+            edge.get("executor_result") != ExecutorResult.LEAN_ACCEPTED.value
+            or edge.get("tactic_label") in NON_KERNEL_TACTICS
+            or type(edge.get("subgoal_count")) is not int
+            or not isinstance(children, list)
+            or len(children) != edge["subgoal_count"]
+            or any(not isinstance(child, str) for child in children)
+            or len(set(children)) != len(children)
+            or any(child not in state_ids for child in children)
         ):
-            closing[edge.get("source_state_id")] = edge.get("tactic_id", "?")
+            continue
+        outgoing.setdefault(edge.get("source_state_id"), []).append(edge)
+
+    closed: set[str] = set()
+
+    def closes(node_id: str, visiting: frozenset[str]) -> bool:
+        if node_id in visiting or node_id not in state_ids:
+            return False
+        if node_id in closed:
+            return True
+        path = visiting | {node_id}
+        for edge in outgoing.get(node_id, ()):
+            if all(closes(child, path) for child in edge["produced_goal_ids"]):
+                closed.add(node_id)
+                return True
+        return False
+
+    for state_id in state_ids:
+        if isinstance(state_id, str):
+            closes(state_id, frozenset())
+    return closed
+
+
+def _check_closure_and_scores(result: Mapping[str, Any]) -> Iterable[SoundnessViolation]:
+    """A state closes only through a complete Lean-only proof path."""
+    closed = _kernel_closed_states(result)
 
     for index, edge in enumerate(result.get("tactic_edges") or []):
         pointer = f"tactic_edges[{index}]"
@@ -228,7 +266,7 @@ def _check_closure_and_scores(result: Mapping[str, Any]) -> Iterable[SoundnessVi
                 ),
                 None,
             )
-            if source_status == "formally-closed":
+            if source_status == "formally-closed" and edge.get("source_state_id") not in closed:
                 yield SoundnessViolation(
                     SoundnessReason.EXECUTOR_FAILURE_AS_SUCCESS,
                     f"{outcome} on {edge.get('source_state_id')!r} is infrastructure "
@@ -248,7 +286,7 @@ def _check_closure_and_scores(result: Mapping[str, Any]) -> Iterable[SoundnessVi
             )
 
         if state.get("status") in ("formally-closed", "lean-verified"):
-            if state["state_id"] not in closing:
+            if state["state_id"] not in closed:
                 scored = bool(annotations)
                 hint = (
                     " while carrying heuristic scores" if scored else ""
@@ -256,13 +294,15 @@ def _check_closure_and_scores(result: Mapping[str, Any]) -> Iterable[SoundnessVi
                 yield SoundnessViolation(
                     SoundnessReason.HEURISTIC_CLOSURE_ATTEMPT,
                     f"state {state['state_id']!r} is marked {state['status']} "
-                    f"with no Lean-accepted zero-goal transition{hint}",
+                    f"with no complete Lean-only proof path{hint}",
                     f"{pointer}.status",
                 )
 
 
 def validate_formal_search_result(
     result: Mapping[str, Any],
+    *,
+    pinned_environment_hash: str | None = None,
 ) -> tuple[SoundnessViolation, ...]:
     """Every structural violation in a formal-search-result payload."""
     findings: list[SoundnessViolation] = []
@@ -274,6 +314,10 @@ def validate_formal_search_result(
 
     findings.extend(_check_closure_and_scores(result))
     findings.extend(check_certificate_replay_binding(result))
+    if pinned_environment_hash is not None:
+        stale = check_environment_staleness(result, pinned_environment_hash)
+        if stale is not None:
+            findings.append(stale)
     return tuple(findings)
 
 
@@ -301,10 +345,27 @@ def check_certificate_replay_binding(
     if not certificate:
         return tuple(findings)
 
+    if result.get("disposition") != "proved-pending-replay":
+        findings.append(
+            SoundnessViolation(
+                SoundnessReason.CERTIFICATE_DISPOSITION_MISMATCH,
+                f"disposition {result.get('disposition')!r} cannot carry a certificate",
+                "certificate",
+            )
+        )
+    elif result.get("root_state_id") not in _kernel_closed_states(result):
+        findings.append(
+            SoundnessViolation(
+                SoundnessReason.CERTIFICATE_WITHOUT_KERNEL_PROOF,
+                "candidate certificate has no complete Lean-only proof of its root",
+                "certificate",
+            )
+        )
+
     status = certificate.get("status")
     if status in ("replay-accepted", "replay-rejected"):
         replay = certificate.get("replay_result")
-        if not replay:
+        if not isinstance(replay, Mapping) or not replay:
             findings.append(
                 SoundnessViolation(
                     SoundnessReason.PROMOTION_WITHOUT_REPLAY,
@@ -313,7 +374,7 @@ def check_certificate_replay_binding(
                     "certificate.status",
                 )
             )
-        elif replay.get("status") != ("replay-accepted" if status == "replay-accepted" else "rejected"):
+        elif replay.get("status") != ("verified" if status == "replay-accepted" else "rejected"):
             findings.append(
                 SoundnessViolation(
                     SoundnessReason.PROMOTION_WITHOUT_REPLAY,
@@ -322,46 +383,31 @@ def check_certificate_replay_binding(
                     "certificate.replay_result",
                 )
             )
-        else:
-            replay_env = replay.get("environment_hash")
-            if replay_env is not None and replay_env != result.get("environment_hash"):
-                findings.append(
-                    SoundnessViolation(
-                        SoundnessReason.REPLAY_ENVIRONMENT_MISMATCH,
-                        f"replayed under {replay_env!r} but the run searched "
-                        f"under {result.get('environment_hash')!r}",
-                        "certificate.replay_result.environment_hash",
-                    )
+        replay_env = replay.get("environment_hash") if isinstance(replay, Mapping) else None
+        if isinstance(replay, Mapping) and replay and replay_env != result.get("environment_hash"):
+            findings.append(
+                SoundnessViolation(
+                    SoundnessReason.REPLAY_ENVIRONMENT_MISMATCH,
+                    f"replayed under {replay_env!r} but the run searched "
+                    f"under {result.get('environment_hash')!r}",
+                    "certificate.replay_result.environment_hash",
                 )
+            )
 
     return tuple(findings)
 
 
 def check_environment_staleness(
-    prior_certificates: Iterable[Mapping[str, Any]],
-    candidate_certificate: Mapping[str, Any],
+    result: Mapping[str, Any],
+    pinned_environment_hash: str,
 ) -> SoundnessViolation | None:
-    """Environment drift (6.12, 11.4): a changed toolchain stales the certificate.
-
-    Compares `candidate_certificate` against every prior certificate for the
-    same declaration. If any prior was produced under a different
-    ``environment_hash``, the candidate cannot be accepted as current: it is
-    reported stale rather than valid. Returns None when no drift is detected.
-    """
-    declaration = candidate_certificate.get("declaration_id")
-    candidate_env = candidate_certificate.get("environment_hash")
-
-    for index, prior in enumerate(prior_certificates):
-        if declaration is not None and prior.get("declaration_id") != declaration:
-            continue
-        prior_env = prior.get("environment_hash")
-        if prior_env is not None and prior_env != candidate_env:
-            return SoundnessViolation(
-                SoundnessReason.ENVIRONMENT_STALE,
-                f"certificate {candidate_certificate.get('artifact_hash', '?')!r} "
-                f"is stale: prior certificate {index} for {declaration!r} was "
-                f"produced under environment {prior_env!r}, candidate under "
-                f"{candidate_env!r}",
-                "environment_hash",
-            )
-    return None
+    """Compare a search result with the declaration's current environment pin."""
+    observed = result.get("environment_hash")
+    if observed == pinned_environment_hash:
+        return None
+    return SoundnessViolation(
+        SoundnessReason.ENVIRONMENT_STALE,
+        f"result for {result.get('declaration_id')!r} searched under {observed!r}, "
+        f"current pin is {pinned_environment_hash!r}",
+        "environment_hash",
+    )
