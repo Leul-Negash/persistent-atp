@@ -7,6 +7,7 @@ writers actually overlap.
 """
 
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -24,7 +25,10 @@ THREADS = 8
 
 def payload(**overrides):
     """A minimal well-formed event payload, as `Proposal.to_dict` produces."""
-    base = {"proof_id": "p1", "actor": "test", "worker_class": "test"}
+    base = {
+        "proof_id": "p1", "actor": "test", "worker_class": "coordinator",
+        "ops": [UpsertNode("FormalState", "p1/fs-1", {"status": "open"}).to_dict()],
+    }
     base.update(overrides)
     return base
 
@@ -83,6 +87,7 @@ class ContentionCase(unittest.TestCase):
         for t in threads:
             t.join(timeout=30)
         for index, exc in enumerate(errors):
+            self.assertFalse(threads[index].is_alive(), f"thread {index} did not finish")
             if exc is not None:
                 raise AssertionError(f"thread {index} raised") from exc
         return results
@@ -166,12 +171,61 @@ class TestContendedAppends(ContentionCase):
 
 
 class TestContendedLeases(ContentionCase):
+    def test_concurrent_openers_migrate_legacy_tokens_only_once(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "CREATE TABLE leases (proof_id TEXT PRIMARY KEY, lease_id TEXT, fencing_token INTEGER)"
+            )
+            conn.execute("INSERT INTO leases VALUES ('p1', 'legacy', 10)")
+
+        def acquire(index: int):
+            return self.store().acquire_lease(
+                "p1", f"lease-{index}", actor=f"worker-{index}", worker_class="coordinator"
+            )
+
+        tokens = sorted(self.run_threads(acquire))
+        self.assertEqual(tokens, list(range(11, 11 + self.THREADS)))
+        self.assertEqual(len(self.store().active_leases("p1")), 1)
+        self.assertEqual(self.store().head("p1"), (0, GENESIS_HASH))
+
+    def test_same_move_dispatch_race_leaves_one_holder_and_one_committer(self):
+        def issue(index: int):
+            return self.store().issue_lease(
+                "p1", f"lease-{index}", actor=f"worker-{index}",
+                worker_class="formal-atp", selected_move_id="p1/rm-1",
+            )
+
+        leases = self.run_threads(issue)
+        store = self.store()
+        active = store.active_leases("p1")
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].fencing_token, self.THREADS)
+        self.assertEqual(store.head("p1"), (0, GENESIS_HASH))
+        self.assertEqual(
+            len([event for event in store.read_lease_events("p1")
+                 if event["event"] == "superseded"]),
+            self.THREADS - 1,
+        )
+
+        def commit(index: int):
+            lease = leases[index]
+            return CommitGate(MemoryView(), self.store()).commit(proposal(
+                index, lease_id=lease.lease_id, fencing_token=lease.fencing_token,
+                selected_move_id=lease.selected_move_id,
+            ))
+
+        results = self.run_threads(commit)
+        self.assertEqual(sum(result.accepted for result in results), 1)
+        self.assertEqual(store.verify_chain("p1"), 1)
+
     def test_fencing_tokens_are_unique_and_strictly_increasing(self):
         """Simultaneous acquires never share or reuse a fencing token."""
 
         def acquire(index: int):
             store = self.store()
-            token = store.acquire_lease("p1", f"lease-{index}")
+            token = store.acquire_lease(
+                "p1", f"lease-{index}", actor=f"worker-{index}", worker_class="formal-atp"
+            )
             return token
 
         tokens = sorted(self.run_threads(acquire))
@@ -188,17 +242,15 @@ class TestContendedLeases(ContentionCase):
         """Invariant 10: the stale write is refused AND stays auditable."""
         writer = self.store()
         auditor = self.store()
-        old_token = writer.acquire_lease("p1", "lease-a")
-        new_token = writer.acquire_lease("p1", "lease-a")
+        old_token = writer.acquire_lease("p1", "lease-a", actor="worker", worker_class="formal-atp")
+        new_token = writer.acquire_lease("p1", "lease-a", actor="worker", worker_class="formal-atp")
         self.assertGreater(new_token, old_token)
 
         gate_view = MemoryView()
         gate = CommitGate(gate_view, writer)
-        stale = Proposal(
-            proof_id="p1",
+        stale = proposal(
+            1,
             actor="worker",
-            worker_class="formal-atp",
-            base_revision=0,
             lease_id="lease-a",
             fencing_token=old_token,
         )
@@ -218,14 +270,21 @@ class TestContendedLeases(ContentionCase):
 class TestContendedGate(ContentionCase):
     def test_simultaneous_gate_commits_accept_exactly_one_proposal(self):
         """The full validate-then-append path holds up under a race."""
-        views = {}
+        issuer = self.store()
+        leases = [issuer.issue_lease(
+            "p1", f"lease-{index}", actor=f"worker-{index}", worker_class="formal-atp",
+            selected_move_id=f"p1/rm-{index}",
+        ) for index in range(self.THREADS)]
 
         def attempt(index: int):
             view = MemoryView()
-            views[index] = view
             store = self.store()
             gate = CommitGate(view, store)
-            return gate.commit(proposal(index))
+            lease = leases[index]
+            return gate.commit(proposal(
+                index, lease_id=lease.lease_id, fencing_token=lease.fencing_token,
+                selected_move_id=lease.selected_move_id,
+            ))
 
         results = self.run_threads(attempt)
         accepted = [r for r in results if r.accepted]
