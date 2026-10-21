@@ -1,6 +1,6 @@
 """The global scheduler: choose the next move, issue its lease (Section 8).
 
-`GlobalScheduler.lease_next(proof_id, worker_class, ttl)` is `proof-lease-next`
+`GlobalScheduler.lease_next(proof_id, worker_class, ttl, actor=...)` is `proof-lease-next`
 (Section 2): one call builds the eligible frontier from committed state,
 scores it with a transparent weighted-sum policy, selects one move, and
 issues a per-move dispatch lease through the journal store -- expiry, mutual
@@ -10,8 +10,8 @@ Invariants this module must never break (2.4 / 7 / 9):
 
 * every score is advisory. The scheduler writes leases and score snapshots,
   never statuses; promotion stays the commit gate's job.
-* an empty frontier is an expected terminal state: `lease_next` returns
-  None, it does not raise.
+* no claimable work is an expected idle state: `lease_next` returns None.
+  Stale revisions and unavailable snapshots are reported as errors.
 * unpopulated features take documented neutral defaults -- zeroing would
   assert "no information gain", which is a claim, not a default.
 """
@@ -23,8 +23,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from commit_gate.gate import CommitResult
-from commit_gate.state import ReadView
-from commit_gate.store import JournalStore, LeaseRow
+from commit_gate.ops import UpsertNode
+from commit_gate.proposal import Proposal
+from commit_gate.reasons import Reason
+from commit_gate.state import JournalOverlayView, ReadView
+from commit_gate.store import ConcurrencyError, JournalStore, LeaseCandidate, LeaseRow
 from commit_gate.vocab import (
     AttemptStatus,
     ClaimStatus,
@@ -35,7 +38,6 @@ from commit_gate.vocab import (
     RunDisposition,
     WorkerClass,
 )
-from .ids import IdType, full_id
 
 __all__ = [
     "Candidate",
@@ -90,6 +92,7 @@ class Candidate:
     category: str  # research-move | formal-run | critic-task
     detail: str
     features: Mapping[str, float] = field(default_factory=dict)
+    conflict_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +101,7 @@ class Lease:
 
     lease_id: str
     proof_id: str
+    actor: str
     worker_class: str
     fencing_token: int
     base_revision: int
@@ -113,6 +117,7 @@ class Lease:
         return cls(
             lease_id=row.lease_id,
             proof_id=row.proof_id,
+            actor=row.actor,
             worker_class=row.worker_class,
             fencing_token=row.fencing_token,
             base_revision=row.base_revision,
@@ -128,6 +133,7 @@ class Lease:
         payload: dict[str, Any] = {
             "lease_id": self.lease_id,
             "proof_id": self.proof_id,
+            "actor": self.actor,
             "worker_class": self.worker_class,
             "fencing_token": self.fencing_token,
             "base_revision": self.base_revision,
@@ -222,7 +228,6 @@ class GlobalScheduler:
         self._policy = policy or SchedulerPolicy()
         self._clock = clock
         self.statistics = statistics or SchedulerStatistics()
-        self._serials: dict[str, int] = {}
 
     # -- public entry point -------------------------------------------------
 
@@ -231,58 +236,74 @@ class GlobalScheduler:
         proof_id: str,
         worker_class: str,
         ttl_seconds: float = 600.0,
+        *,
+        actor: str,
     ) -> Lease | None:
         """`proof-lease-next`: select and lease the best eligible move.
 
-        Returns None when nothing is eligible -- the outer coordinator's cue
-        to audit or expand the frontier, never an error.
+        Returns None when no eligible move is free. A changed journal revision
+        raises ConcurrencyError; the caller may retry with a fresh snapshot.
+        The trusted caller supplies the actual worker's actor and class.
         """
-        active_moves = {
-            row.selected_move_id
-            for row in self._store.active_leases(proof_id)
-            if row.selected_move_id is not None
-        }
-        frontier = [
-            candidate
-            for candidate in self.build_frontier(proof_id)
-            if candidate.move_id not in active_moves
-        ]
-        if not frontier:
-            return None
-
+        revision, frontier = self._snapshot_frontier(proof_id)
         scored = []
         for candidate in frontier:
             features = self._feature_vector(candidate, worker_class)
             priority, snapshot = self._policy.score(features)
             scored.append((priority, candidate, snapshot))
         scored.sort(key=lambda item: item[0], reverse=True)
-        _, chosen, snapshot = scored[0]
-
-        lease_id = self._next_lease_id(proof_id)
-        row = self._store.issue_lease(
+        row = self._store.claim_next(
             proof_id,
-            lease_id,
+            [LeaseCandidate(candidate.move_id, snapshot, candidate.conflict_ids)
+             for _, candidate, snapshot in scored],
+            actor=actor,
             worker_class=worker_class,
-            selected_move_id=chosen.move_id,
+            base_revision=revision,
             ttl_seconds=ttl_seconds,
-            score_snapshot=snapshot,
         )
+        if row is None:
+            return None
+        snapshot = next(snapshot for _, candidate, snapshot in scored
+                        if candidate.move_id == row.selected_move_id)
         return Lease.from_row(row, snapshot, self._policy.name)
 
-    def release(self, proof_id: str, lease_id: str) -> bool:
+    def release(self, proof_id: str, lease_id: str, *, fencing_token: int) -> bool:
         """Mark a dispatched lease finished (its token dies either way)."""
-        return self._store.release_lease(proof_id, lease_id)
+        return self._store.release_lease(proof_id, lease_id, fencing_token=fencing_token)
 
     # -- frontier construction (Section 3) ----------------------------------
 
     def build_frontier(self, proof_id: str) -> list[Candidate]:
         """Every committable object eligible for dispatch right now."""
+        return self._snapshot_frontier(proof_id)[1]
+
+    def _snapshot_frontier(self, proof_id: str) -> tuple[int, list[Candidate]]:
+        try:
+            view_revision, snapshot = self._view.snapshot(proof_id)
+        except Exception as exc:
+            raise ConcurrencyError(
+                Reason.READ_VIEW_OUT_OF_SYNC, f"could not snapshot scheduling state: {exc}",
+            ) from exc
+        revision = self._store.head(proof_id)[0]
+        if type(view_revision) is not int or not 0 <= view_revision <= revision:
+            raise ConcurrencyError(
+                Reason.READ_VIEW_OUT_OF_SYNC,
+                f"view revision {view_revision!r} is invalid for journal head {revision}",
+            )
+        events = self._store.read_events_between(proof_id, view_revision, revision)
+        ops = tuple(op for event in events for op in Proposal.from_dict(event).ops)
+        node_ids = dict.fromkeys(self._node_ids(snapshot))
+        node_ids.update((op.node_id, None) for op in ops if isinstance(op, UpsertNode))
+        view = JournalOverlayView(snapshot, revision, ops)
+        return revision, self._build_frontier(proof_id, view, node_ids)
+
+    def _build_frontier(self, proof_id: str, view: ReadView, node_ids: Mapping[str, None]) -> list[Candidate]:
         prefix = f"{proof_id}/"
         nodes = {
             node_id: record
-            for node_id in self._node_ids()
+            for node_id in node_ids
             if node_id.startswith(prefix)
-            and (record := self._view.node(node_id)) is not None
+            and (record := view.node(node_id)) is not None
         }
         candidates: list[Candidate] = []
 
@@ -296,8 +317,8 @@ class GlobalScheduler:
                 ResearchStateStatus.STALE.value,
             ):
                 continue
-            for edge in self._view.edges_from(state_id, "PROPOSES"):
-                move = nodes.get(edge.dst_id) or self._view.node(edge.dst_id)
+            for edge in view.edges_from(state_id, "PROPOSES"):
+                move = nodes.get(edge.dst_id)
                 if move is None or move.label != "ResearchMove":
                     continue
                 if move.fields.get("status") in (
@@ -322,6 +343,12 @@ class GlobalScheduler:
             if record.label == "FormalDeclaration" and record.fields.get(
                 "status"
             ) in (DeclarationStatus.ALIGNED.value, DeclarationStatus.SEARCHING.value):
+                # An existing run, not its declaration, is the continuation target.
+                if record.fields.get("status") != DeclarationStatus.ALIGNED.value or any(
+                    nodes.get(edge.src_id) is not None and nodes[edge.src_id].label == "FormalRun"
+                    for edge in view.edges_to(node_id, "SEARCHES")
+                ):
+                    continue
                 candidates.append(
                     Candidate(
                         move_id=node_id,
@@ -338,12 +365,22 @@ class GlobalScheduler:
             elif record.label == "FormalRun":
                 if record.fields.get("status") != RunDisposition.SEARCHING.value:
                     continue
-                if self._run_has_open_checkpoint(node_id):
+                targets = {edge.dst_id for edge in view.edges_from(node_id, "SEARCHES")}
+                if len(targets) != 1:
+                    continue
+                target_id = next(iter(targets))
+                target = nodes.get(target_id)
+                if target is None or target.label != "FormalDeclaration" or target.fields.get("status") not in (
+                    DeclarationStatus.ALIGNED.value, DeclarationStatus.SEARCHING.value,
+                ):
+                    continue
+                if self._run_has_open_checkpoint(view, node_id):
                     candidates.append(
                         Candidate(
                             move_id=node_id,
                             category="formal-run",
                             detail="searching run with an outstanding checkpoint",
+                            conflict_ids=(target_id, *(edge.src_id for edge in view.edges_to(target_id, "SEARCHES"))),
                             features={
                                 "formalization_readiness": 0.9,
                                 "expected_theorem_impact": 0.8,
@@ -357,9 +394,9 @@ class GlobalScheduler:
             elif record.label == "Claim":
                 if record.fields.get("status") != ClaimStatus.PROVISIONAL.value:
                     continue
-                if self._has_favorable_verdict(node_id):
+                if self._has_favorable_verdict(view, node_id):
                     continue
-                dependencies = len(self._view.edges_from(node_id, "DEPENDS_ON"))
+                dependencies = len(view.edges_from(node_id, "DEPENDS_ON"))
                 candidates.append(
                     Candidate(
                         move_id=node_id,
@@ -406,8 +443,8 @@ class GlobalScheduler:
 
     # -- helpers ---------------------------------------------------------------
 
-    def _node_ids(self) -> list[str]:
-        nodes = getattr(self._view, "nodes", None)
+    def _node_ids(self, view: ReadView) -> list[str]:
+        nodes = getattr(view, "nodes", None)
         if nodes is None:
             raise TypeError(
                 "frontier construction needs a view exposing known node ids "
@@ -415,9 +452,9 @@ class GlobalScheduler:
             )
         return list(nodes.keys())
 
-    def _has_favorable_verdict(self, claim_id: str) -> bool:
-        for edge in self._view.edges_to(claim_id, "REVIEWS_CLAIM"):
-            attempt = self._view.node(edge.src_id)
+    def _has_favorable_verdict(self, view: ReadView, claim_id: str) -> bool:
+        for edge in view.edges_to(claim_id, "REVIEWS_CLAIM"):
+            attempt = view.node(edge.src_id)
             if attempt is None or attempt.label != "Attempt":
                 continue
             if (
@@ -428,14 +465,14 @@ class GlobalScheduler:
                 return True
         return False
 
-    def _run_has_open_checkpoint(self, run_id: str) -> bool:
-        for edge in self._view.edges_from(run_id, "HAS_CHECKPOINT"):
-            checkpoint = self._view.node(edge.dst_id)
+    def _run_has_open_checkpoint(self, view: ReadView, run_id: str) -> bool:
+        for edge in view.edges_from(run_id, "HAS_CHECKPOINT"):
+            checkpoint = view.node(edge.dst_id)
             if checkpoint is None:
                 continue
             open_states = [
-                self._view.node(frontier.dst_id)
-                for frontier in self._view.edges_from(
+                view.node(frontier.dst_id)
+                for frontier in view.edges_from(
                     edge.dst_id, "CHECKPOINT_FRONTIER"
                 )
             ]
@@ -447,8 +484,3 @@ class GlobalScheduler:
             ):
                 return True
         return False
-
-    def _next_lease_id(self, proof_id: str) -> str:
-        serial = self._serials.get(proof_id, 0) + 1
-        self._serials[proof_id] = serial
-        return full_id(proof_id, IdType.LEASE, serial)

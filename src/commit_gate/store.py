@@ -21,7 +21,7 @@ from .canon import GENESIS_HASH, canonical_json, chain_hash
 from .reasons import Reason
 from .vocab import WorkerClass
 
-__all__ = ["JournalStore", "ConcurrencyError", "HashChainError", "LeaseRow"]
+__all__ = ["JournalStore", "ConcurrencyError", "HashChainError", "LeaseRow", "LeaseCandidate"]
 
 
 class ConcurrencyError(Exception):
@@ -65,6 +65,15 @@ class LeaseRow:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseCandidate:
+    """A ranked move and other IDs representing the same work target."""
+
+    move_id: str
+    score_snapshot: dict[str, float]
+    conflict_ids: tuple[str, ...] = ()
 
 
 class JournalStore:
@@ -343,6 +352,54 @@ class JournalStore:
                 conn, proof_id, lease_id, actor, worker_class, selected_move_id,
                 revision, ttl_seconds, now_ns, "issued", score_snapshot,
             )
+
+    def claim_next(
+        self, proof_id: str, candidates: Sequence[LeaseCandidate], *,
+        actor: str, worker_class: str, base_revision: int,
+        ttl_seconds: float = 600.0,
+    ) -> LeaseRow | None:
+        """Reserve the first free candidate without superseding another worker.
+
+        Ranking happens outside the lock; the revision check ensures it still
+        describes committed state when the reservation is made.
+        """
+        worker_class = self._validate_holder(actor, worker_class, ttl_seconds)
+        for candidate in candidates:
+            if not candidate.move_id.startswith(f"{proof_id}/") or candidate.move_id == f"{proof_id}/":
+                raise ValueError("a dispatch lease needs a move in the proof namespace")
+        with self._write() as conn:
+            now_ns = self._clock_ns()
+            self._expire_due_leases(conn, proof_id, now_ns)
+            revision = self.head(proof_id)[0]
+            if type(base_revision) is not int or base_revision != revision:
+                raise ConcurrencyError(
+                    Reason.STALE_BASE_REVISION,
+                    f"dispatch is based on revision {base_revision!r}, head is {revision}",
+                )
+            busy = {row["selected_move_id"] for row in conn.execute(
+                "SELECT selected_move_id FROM leases WHERE proof_id = ? AND status = 'active'",
+                (proof_id,),
+            )}
+            if None in busy:  # An exclusive proof-wide lease blocks dispatch.
+                return None
+            for candidate in candidates:
+                if busy.intersection((candidate.move_id, *candidate.conflict_ids)):
+                    continue
+                row = conn.execute(
+                    "SELECT MAX(fencing_token) AS top FROM leases WHERE proof_id = ?", (proof_id,),
+                ).fetchone()
+                serial = (row["top"] or 0) + 1
+                while conn.execute(
+                    "SELECT 1 FROM leases WHERE proof_id = ? AND lease_id = ?",
+                    (proof_id, f"{proof_id}/ls-{serial}"),
+                ).fetchone() is not None:
+                    serial += 1
+                return self._insert_lease(
+                    conn, proof_id, f"{proof_id}/ls-{serial}", actor, worker_class,
+                    candidate.move_id, revision, ttl_seconds, now_ns, "issued",
+                    candidate.score_snapshot,
+                )
+        return None
 
     def _insert_lease(
         self, conn: sqlite3.Connection, proof_id: str, lease_id: str,

@@ -42,11 +42,15 @@ def fixture_view() -> MemoryView:
     # open checkpoint frontier; a closed declaration; a stagnated run.
     v.add_node("p1/fd-1", "FormalDeclaration", {"status": "aligned"})
     v.add_node("p1/fd-2", "FormalDeclaration", {"status": "replay-accepted"})
+    v.add_node("p1/fd-3", "FormalDeclaration", {"status": "searching"})
+    v.add_node("p1/fd-4", "FormalDeclaration", {"status": "searching"})
     v.add_node("p1/fs-open", "FormalState", {"status": "open"})
     v.add_node("p1/fs-done", "FormalState", {"status": "formally-closed"})
     v.add_node("p1/fr-1", "FormalRun", {"status": "searching"})
     v.add_node("p1/fr-2", "FormalRun", {"status": "searching"})
     v.add_node("p1/fr-3", "FormalRun", {"status": "stagnated"})
+    v.add_edge("SEARCHES", "p1/fr-1", "p1/fd-3", "p1/e-search1")
+    v.add_edge("SEARCHES", "p1/fr-2", "p1/fd-4", "p1/e-search2")
     v.add_node("p1/fc-1", "FormalCheckpoint", {})
     v.add_node("p1/fc-2", "FormalCheckpoint", {})
     v.add_edge("HAS_CHECKPOINT", "p1/fr-1", "p1/fc-1", "p1/e-fc1")
@@ -99,34 +103,34 @@ class TestLeaseNext(SchedulerCase):
         from mathproof.schemas import validate
 
         lease = self.scheduler().lease_next(
-            "p1", WorkerClass.CRITIC.value, ttl_seconds=120.0
+            "p1", WorkerClass.CRITIC.value, ttl_seconds=120.0, actor="worker"
         )
         self.assertIsNotNone(lease)
         self.assertEqual(validate("lease", lease.to_dict()), [])
 
     def test_lease_ids_come_from_the_allocator_namespace(self):
-        lease = self.scheduler().lease_next("p1", "critic")
+        lease = self.scheduler().lease_next("p1", "critic", actor="worker")
         prefix, _serial = parse_local_id(lease.lease_id.split("/", 1)[1])
         self.assertEqual(prefix.value, "ls")
 
     def test_empty_frontier_is_none_not_an_exception(self):
         scheduler = GlobalScheduler(MemoryView(), JournalStore())
-        self.assertIsNone(scheduler.lease_next("p3", "formal-atp"))
+        self.assertIsNone(scheduler.lease_next("p3", "formal-atp", actor="worker"))
 
     def test_a_leased_move_is_never_double_dispatched(self):
         scheduler = self.scheduler()
         seen = set()
         for _ in range(len(ELIGIBLE)):
-            lease = scheduler.lease_next("p1", WorkerClass.COORDINATOR.value)
+            lease = scheduler.lease_next("p1", WorkerClass.COORDINATOR.value, actor="worker")
             self.assertIsNotNone(lease)
             self.assertNotIn(lease.selected_move_id, seen)
             seen.add(lease.selected_move_id)
-        self.assertIsNone(scheduler.lease_next("p1", WorkerClass.COORDINATOR.value))
+        self.assertIsNone(scheduler.lease_next("p1", WorkerClass.COORDINATOR.value, actor="worker"))
         self.assertEqual(seen, ELIGIBLE)
 
     def test_every_snapshot_names_all_ten_features_and_is_journalled(self):
         scheduler = self.scheduler()
-        lease = scheduler.lease_next("p1", "critic")
+        lease = scheduler.lease_next("p1", "critic", actor="worker")
         self.assertEqual(set(lease.score_snapshot.keys()), set(FEATURES))
 
         issued = [
@@ -151,15 +155,15 @@ class TestScoring(SchedulerCase):
         )
 
         self.assertEqual(
-            by_verification.lease_next("p1", "critic").selected_move_id, "p1/c-1"
+            by_verification.lease_next("p1", "critic", actor="worker").selected_move_id, "p1/c-1"
         )
         self.assertEqual(
-            by_readiness.lease_next("p1", "formal-atp").selected_move_id, "p1/fd-1"
+            by_readiness.lease_next("p1", "formal-atp", actor="worker").selected_move_id, "p1/fd-1"
         )
 
     def test_availability_feature_prefers_the_matching_worker_class(self):
         scheduler = self.scheduler(policy=zeroed(availability_of_suitable_worker_or_model_or_tool=1.0))
-        lease = scheduler.lease_next("p1", WorkerClass.FORMAL_ATP.value)
+        lease = scheduler.lease_next("p1", WorkerClass.FORMAL_ATP.value, actor="worker")
         self.assertIn(lease.selected_move_id, {"p1/fd-1", "p1/fr-1"})
 
     def test_unpopulated_features_take_neutral_defaults_not_zeros(self):
@@ -217,7 +221,7 @@ class TestInvariantBoundary(SchedulerCase):
         }
         scheduler = self.scheduler()
         for _ in range(len(ELIGIBLE)):
-            if scheduler.lease_next("p1", "coordinator") is None:
+            if scheduler.lease_next("p1", "coordinator", actor="worker") is None:
                 break
         after = {
             node_id: (record.label, dict(record.fields))

@@ -8,6 +8,7 @@
   "required": [
     "lease_id",
     "proof_id",
+    "actor",
     "worker_class",
     "fencing_token",
     "base_revision",
@@ -22,6 +23,7 @@
       "pattern": "^[^/]+/ls-[1-9][0-9]*$"
     },
     "proof_id": { "type": "string", "minLength": 1 },
+    "actor": { "type": "string", "minLength": 1 },
     "worker_class": {
       "description": "Mirrors commit_gate.vocab.WorkerClass; the explorer role leases as llm-research.",
       "enum": [
