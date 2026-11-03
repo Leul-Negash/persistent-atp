@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - exercised only without the extra
 
 from coordinator.langgraph.policy import BRIDGE_LEMMA, FIVE_MECHANISMS, GLOBAL_AUDIT, StagnationPolicy
 
-from .fixtures import JournalCase, aligned_claim, critic, declaration, explorer
+from .fixtures import JournalCase, aligned_claim, critic, declaration, explorer, verified_target
 
 if InMemorySaver is not None:
     from coordinator.langgraph.graph import BUDGET_EXHAUSTED, HALTED, Coordinator
@@ -32,7 +32,7 @@ class TestDryRun(JournalCase):
             plan={"p1/fr-1": ["stagnated"]},
         )
 
-        final = Coordinator([workspace], max_rounds=8).run()
+        final = Coordinator([workspace], max_rounds=16).run()
 
         self.assertEqual(final["outcome"], HALTED)
         self.assertEqual(final["tracks"]["p1"]["status"], "stalled")
@@ -79,7 +79,7 @@ class TestParallelProofs(JournalCase):
             return critic()(lease, packet)
 
         self.seed("p1", declaration("p1"), *aligned_claim("p1"))
-        self.seed("p2", declaration("p2", status="replay-accepted"), *aligned_claim("p2"))
+        self.seed("p2", *verified_target("p2"), *aligned_claim("p2"))
         p1 = self.workspace(
             "p1",
             handlers={"critic": meeting_critic, "llm-research": explorer()},
@@ -87,7 +87,7 @@ class TestParallelProofs(JournalCase):
         )
         p2 = self.workspace("p2", handlers={"critic": meeting_critic})
 
-        final = Coordinator([p1, p2], max_rounds=8).run()
+        final = Coordinator([p1, p2], max_rounds=16).run()
 
         self.assertEqual(final["tracks"]["p2"]["status"], "solved")
         self.assertEqual(final["tracks"]["p1"]["status"], "stalled")

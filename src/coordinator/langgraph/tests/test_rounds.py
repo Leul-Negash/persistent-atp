@@ -13,7 +13,8 @@ from coordinator.langgraph.escalate import COORDINATOR_EDGES, COORDINATOR_LABELS
 from coordinator.langgraph.policy import BRIDGE_LEMMA, FIVE_MECHANISMS, GLOBAL_AUDIT, REPAIR
 from coordinator.langgraph.rounds import ACTIVE, PARKED, SOLVED, STALLED, assess, new_track, work
 
-from .fixtures import JournalCase, aligned_claim, critic, declaration, explorer
+from .fixtures import JournalCase, aligned_claim, critic, declaration, explorer, mechanism_answer, verified_target
+from coordinator.langgraph.mechanisms import mechanism_moves
 
 
 def candidate_certificate(proof_id: str) -> list:
@@ -126,10 +127,7 @@ class TestEscalation(RoundCase):
     def test_two_rounds_without_progress_ask_for_five_mechanisms_and_queue_them(self):
         self.seed("p1", declaration("p1"))
         answers = {
-            FIVE_MECHANISMS: [
-                {"detail": f"try {tag}", "technique_tags": [tag]}
-                for tag in ("induction", "extremal", "algebraic", "analytic", "probabilistic")
-            ]
+            FIVE_MECHANISMS: mechanism_moves(mechanism_answer())
         }
         workspace = self.workspace(
             "p1",
@@ -225,12 +223,12 @@ class TestJournalAuthority(RoundCase):
 
 
 class TestEnding(RoundCase):
-    def test_a_replayed_declaration_solves_the_proof(self):
-        self.seed("p1", declaration("p1", status="replay-accepted"), *aligned_claim("p1"))
+    def test_a_verified_registered_target_solves_the_proof(self):
+        self.seed("p1", *verified_target("p1"), *aligned_claim("p1"))
         workspace = self.workspace("p1", handlers={"critic": critic()})
         track, raised, milestones = assess(workspace, new_track(), work(workspace, 1))
         self.assertEqual(track["status"], SOLVED)
-        self.assertIn("p1: solved; every declaration replayed", milestones)
+        self.assertIn("p1: solved; every registered target is Lean verified", milestones)
 
     def test_a_certificate_awaiting_replay_parks_the_proof(self):
         # The search is over and its certificate waits for the replayer.

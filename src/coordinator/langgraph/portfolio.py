@@ -21,6 +21,7 @@ from mathproof.cycle import CycleDigest, run_cycle
 from mathproof.scheduler import Candidate, GlobalScheduler, SchedulerStatistics
 
 from .workspace import ProofWorkspace, project
+from .mechanisms import MechanismDispatcher, InvalidMechanisms
 
 __all__ = ["Slot", "PORTFOLIO", "SlotScheduler", "frontier_by_category", "run_portfolio"]
 
@@ -45,6 +46,11 @@ class SlotScheduler(GlobalScheduler):
     def __init__(self, view, store, *, category: str, statistics: SchedulerStatistics):
         super().__init__(view, store, statistics=statistics)
         self.category = category
+        self.last_lease = None
+
+    def lease_next(self, *args, **kwargs):
+        self.last_lease = super().lease_next(*args, **kwargs)
+        return self.last_lease
 
     def _build_frontier(
         self, proof_id: str, view: ReadView, node_ids: Mapping[str, None]
@@ -80,16 +86,30 @@ def run_portfolio(
         scheduler = SlotScheduler(
             workspace.view, store, category=slot.category, statistics=workspace.statistics
         )
-        digest = run_cycle(
-            proof_id,
-            view=workspace.view,
-            gate=gate,
-            scheduler=scheduler,
-            dispatcher=workspace.dispatcher,
-            adapters=workspace.adapters,
-            worker_class=slot.worker_class,
-            maintenance=lambda proposal, commit: project(workspace.view, store, proof_id),
-        )
+        try:
+            digest = run_cycle(
+                proof_id,
+                view=workspace.view,
+                gate=gate,
+                scheduler=scheduler,
+                dispatcher=MechanismDispatcher(workspace.dispatcher, workspace.view),
+                adapters=workspace.adapters,
+                worker_class=slot.worker_class,
+                maintenance=lambda proposal, commit: project(workspace.view, store, proof_id),
+            )
+        except Exception as exc:
+            lease = scheduler.last_lease
+            known_invalid = isinstance(exc, InvalidMechanisms)
+            if known_invalid and lease is not None:
+                scheduler.release(proof_id, lease.lease_id, fencing_token=lease.fencing_token)
+            reports.append({"slot": slot.role, "worker_class": slot.worker_class,
+                "move_id": lease.selected_move_id if lease else None, "accepted": False,
+                "revision": None, "rejections": [],
+                "outcome": "invalid-worker-result" if known_invalid else "execution-unknown",
+                "error_code": type(exc).__name__, "detail": str(exc)[:500]})
+            # Unknown execution may still be in flight. Keep its fencing lease
+            # alive, and never dispatch a replacement inside this call.
+            break
         reports.append(_slot_report(slot, digest))
     project(workspace.view, store, proof_id)
     return reports
@@ -103,4 +123,6 @@ def _slot_report(slot: Slot, digest: CycleDigest) -> dict[str, Any]:
         "accepted": digest.accepted,
         "revision": digest.revision,
         "rejections": [rejection.reason.value for rejection in digest.rejections],
+        "outcome": ("accepted" if digest.accepted else
+                    "rejected" if digest.rejections else "waiting-on-lease"),
     }

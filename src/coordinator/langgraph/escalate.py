@@ -17,10 +17,11 @@ from commit_gate.ops import AddEdge, UpsertNode
 from commit_gate.proposal import Proposal
 from commit_gate.state import MemoryView
 from commit_gate.store import JournalStore
+from commit_gate.reasons import Reason, Rejection
 from mathproof.dispatch import _next_serial
 from shared.vocab import WorkerClass
 
-from .policy import Escalation
+from .policy import Escalation, _not_on_record
 from .progress import COORDINATOR_ROLE, ProofReading, nodes_of
 
 __all__ = ["COORDINATOR_ACTOR", "COORDINATOR_LABELS", "escalation_ops", "commit_escalations"]
@@ -99,6 +100,13 @@ def commit_escalations(
     """
     if not escalations:
         return None
+    if (store.head(proof_id)[0] != reading.revision
+            or view.snapshot(proof_id)[0] != reading.revision):
+        return CommitResult(False, (Rejection(Reason.STALE_BASE_REVISION,
+            "assessment revision differs from the committed head or projection"),), None, None)
+    escalations = _not_on_record(view, proof_id, reading, list(escalations))
+    if not escalations:
+        return None
     ops = escalation_ops(
         view, proof_id, escalations, reading=reading, round_number=round_number
     )
@@ -116,7 +124,7 @@ def commit_escalations(
                 actor=COORDINATOR_ACTOR,
                 worker_class=WorkerClass.COORDINATOR.value,
                 ops=tuple(ops),
-                base_revision=store.head(proof_id)[0],
+                base_revision=reading.revision,
                 lease_id=lease_id,
                 fencing_token=fencing_token,
             )

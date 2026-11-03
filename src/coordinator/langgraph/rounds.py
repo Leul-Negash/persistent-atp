@@ -99,7 +99,7 @@ def assess(
         status = ACTIVE
         if reading.solved:
             status = SOLVED
-            milestones.append(f"{proof_id}: solved; every declaration replayed")
+            milestones.append(f"{proof_id}: solved; every registered target is Lean verified")
         elif not frontier_by_category(workspace, store):
             if reading.awaiting_replay:
                 status = PARKED

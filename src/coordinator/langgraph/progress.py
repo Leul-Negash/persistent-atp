@@ -56,6 +56,8 @@ class ProofReading:
     replayed_declarations: int = 0
     declarations: int = 0
     pending_certificates: int = 0
+    target_claims: int = 0
+    verified_targets: int = 0
 
     @property
     def progress(self) -> tuple[int, int, int]:
@@ -68,7 +70,9 @@ class ProofReading:
 
     @property
     def solved(self) -> bool:
-        return self.declarations > 0 and self.replayed_declarations == self.declarations
+        # Claim promotion is guarded by exact alignment and independent replay
+        # at the gate. Replaying unrelated declarations cannot solve a target.
+        return self.target_claims > 0 and self.verified_targets == self.target_claims
 
     @property
     def awaiting_replay(self) -> bool:
@@ -92,6 +96,8 @@ def read_proof(view: MemoryView, proof_id: str, revision: int) -> ProofReading:
             if node.fields.get("status") in statuses
         )
 
+    targets = {edge.dst_id for proof in nodes_of(view, proof_id, "Proof")
+               for edge in view.edges_from(proof.node_id, "HAS_TARGET")}
     return ProofReading(
         revision=revision,
         settled_claims=count("Claim", SETTLED_CLAIMS),
@@ -101,6 +107,11 @@ def read_proof(view: MemoryView, proof_id: str, revision: int) -> ProofReading:
         ),
         declarations=sum(1 for _ in nodes_of(view, proof_id, "FormalDeclaration")),
         pending_certificates=count("Certificate", PENDING_CERTIFICATES),
+        target_claims=len(targets),
+        verified_targets=sum(1 for target_id in targets
+            if target_id.startswith(proof_id + "/")
+            and (target := view.node(target_id)) is not None
+            and target.label == "Claim" and target.fields.get("status") == "lean-verified"),
     )
 
 
