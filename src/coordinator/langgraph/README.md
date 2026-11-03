@@ -11,7 +11,7 @@ plan_round --Send per active proof--> work --> assess --> plan_round | END
 1. **`plan_round`** opens the round and fans the active proofs out with LangGraph's `Send`.
 2. **`work`** runs one proof's portfolio (Section 8.6): one `run_cycle` per slot that has work — *exploit* (formal search), *explore* (research moves, including the coordinator's escalations) and *critic* (provisional claims). Proofs run in parallel; the slots of one proof run in turn, because a proposal must be based on the head it commits onto.
 3. **`assess`** joins the round. For each proof it re-reads committed state, updates the stall count, raises the escalations the stagnation policy calls for, commits them, and records milestone messages (Section 10.7).
-4. The run ends when every proof is solved, when no proof can move without a replay or a human (`halted`), or when the round budget runs out.
+4. The run ends when every proof is solved, when no proof can move without a replay or a human (`halted`), or when the round budget runs out. An unknown worker outcome sets that proof to `waiting-on-worker` and requires reconciliation before resuming.
 
 ## The stagnation policy
 
@@ -26,13 +26,17 @@ plan_round --Send per active proof--> work --> assess --> plan_round | END
 | 5 | a reviewed alignment or an obstruction doubting the statement | `alignment-review`, which holds rules 3 and 4 for that declaration |
 | 6 | an empty frontier, or `global_stall_rounds` rounds stalled | `global-audit` |
 
-Progress means verified gain only: a settled claim, a closed formal state or a replayed declaration. A certificate waiting for replay pauses the stall rules instead of counting as stagnation (Section 10.3). Thresholds are `StagnationPolicy` configuration.
+Progress tracks settled claims, closed formal states and replayed declarations. A critic-accepted claim is a research milestone, not formal proof. A certificate waiting for replay pauses the stall rules instead of counting as stagnation (Section 10.3). Thresholds are `StagnationPolicy` configuration.
+
+Completion requires at least one registered `HAS_TARGET` claim and every registered target at the gate-protected `lean-verified` status. Replayed declarations alone do not solve the proof. The gate is responsible for enforcing exact alignment and independent replay when a claim is promoted.
 
 ## Authority
 
 The coordinator decides *that* something must happen, never the mathematics of it. Each escalation becomes a queued `ResearchMove` under the coordinator's own `ResearchState`, committed through the gate under a proof-wide lease; a worker takes the move in a later round like any other. The gate trusts the `coordinator` worker class with any label, so the limit is kept in `escalate.py` and checked by the tests: the coordinator writes no claim status, formal state, certificate or obstruction (Section 3.2, invariant 7).
 
 `mechanisms.py` fixes what a worker's five-mechanism answer must state and checks it is complete and diverse (one technique tag per mechanism) before it becomes queued moves.
+
+The portfolio applies this validator to actual `five-mechanisms` worker answers before building a proposal. Answers may use `mechanisms` or `moves`; each entry must supply the complete `MECHANISM_FIELDS` contract. Invalid answers produce `invalid-worker-result`, release that completed dispatch's lease, and commit nothing. Required prerequisite claims must belong to the leased proof.
 
 ## The journal is the authority
 
@@ -48,6 +52,53 @@ The graph state is a cache (Section 2.3, invariant 6). It holds round counters, 
 - **`rounds.py`**: One round for one proof — `work` and `assess` — without LangGraph.
 - **`mechanisms.py`**: The five-mechanism answer contract.
 - **`graph.py`**: The LangGraph `StateGraph` and `Coordinator`.
+- **`runtime.py`**: The registered synchronous calling facade used by the graph, with consistent reads, category-selected slots, and revision-bound escalation batches.
+
+## Runtime calls
+
+The trusted host registers its existing `ProofWorkspace` objects. Registration supplies the store factory, dispatcher and adapters; individual runtime calls cannot select an actor, worker implementation, database path or fencing token. Each store factory call must return a new caller-owned connection, which the coordinator closes after use.
+
+```python
+from coordinator.langgraph import CoordinatorRuntime, Escalation, StaleAssessment
+from coordinator.langgraph.rounds import new_track
+
+# workspace is a ProofWorkspace configured by the trusted service host.
+runtime = CoordinatorRuntime([workspace])
+proof_id = workspace.proof_id
+
+state = runtime.read_coordination(proof_id)
+print(state.revision, state.progress.progress)
+print(state.to_dict())
+
+slot = runtime.run_slot(
+    proof_id, "critic-task", expected_revision=state.revision
+)
+print(slot["outcome"], slot["accepted"], slot["rejections"])
+
+# Refresh before making a snapshot-dependent decision.
+state = runtime.read_coordination(proof_id)
+receipt = runtime.queue_escalations(
+    proof_id,
+    [Escalation("global-audit", proof_id, "Audit the current proof")],
+    expected_revision=state.revision,
+    round_number=1,
+)
+print(receipt["outcome"], receipt["lease_events"])
+print(runtime.read_escalations(proof_id))
+
+# Alternatively run the existing work/assess functions as one convenience call.
+round_result = runtime.run_round(proof_id, 2, new_track())
+```
+
+`read_coordination` returns all scoped nodes, edges, frontier entries, progress and recorded escalations at one journal revision/hash. Its records are deeply immutable and `to_dict()` returns JSON-compatible values. A moving journal is retried at most three times. Reads do not advance the journal revision.
+
+`run_slot` supports `formal-run`, `research-move` and `critic-task`. It serializes calls within a registered proof while allowing different proofs to execute concurrently. Each call is an intentional new cycle; it is not an idempotent remote submission. Its outcome distinguishes `accepted`, `rejected`, `idle`, `waiting-on-lease`, `stale-assessment`, `invalid-worker-result`, and `execution-unknown`. A successful function return does not imply formal closure.
+
+`queue_escalations` submits at most 100 complete escalations as one gate proposal. It preserves target IDs, optional claim links, details, progress basis and round. Duplicate policy intents are removed using committed coordinator records; a restarted runtime with a fresh revision therefore does not recreate them. Stale assessment revisions raise `StaleAssessment` before mutation or produce a gate rejection if a race occurs during submission. Refresh and reassess rather than silently rebasing a previous decision.
+
+The existing proof-wide escalation lease still supersedes active dispatches. The receipt includes observed lease audit events so supersession is visible, without exposing fencing tokens. This is not a non-preempting queue. The audit is separate from the proof hash chain.
+
+The facade and LangGraph graph reuse the original round, portfolio, scheduler, dispatcher and gate implementations. There is no `persistent-atp-client` dependency in this stage.
 
 ## Running
 
@@ -60,9 +111,25 @@ python -m pytest src/coordinator/langgraph/tests
 
 `test_graph.py` is skipped when LangGraph is not installed.
 
+Verification on Python 3.13 with LangGraph 1.2.19:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \
+  src/coordinator/langgraph/tests
+# 63 passed, including all five LangGraph graph tests
+
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q --tb=short
+# 475 passed, 15 failed, 85 subtests passed; no skipped tests
+```
+
+Before changes, the same branch had 451 passed, 15 failed, five skipped graph tests and 85 subtests passed. The remaining 15 failures are PostgreSQL artifact tests: the configured `user` cannot authenticate at `127.0.0.1:5432`. Coordinator integration tests use a real gate and SQLite journal, scripted workers, and `FakeFormalATP`. Completion fixtures contain explicitly synthetic bound replay records; no real Lean execution or independent replay was tested.
+
 ## Not yet covered
 
 - Two cycles on the same proof cannot overlap: the gate requires a proposal's base revision to equal the head, so a second commit on one proof would be rejected as stale. Parallelism is across proofs until the gate can rebase a disjoint proposal.
 - Workers are scripted in the tests. A real LLM worker for the five-mechanism request, and routing `alignment-review` moves to the alignment reviewer instead of the research slot, are next steps.
 - Replay is not driven by the coordinator; a proof whose certificate awaits replay is parked.
 - Rules 3 and 4 read obstructions directly; the per-run routing of Section 8.7 (`routing.evaluate_run`, on `feat/scheduler-routing-concurrency`) is not on this branch yet and can feed them once it is.
+- Calls are synchronous. A worker can block its caller; a lease TTL fences a late commit but does not terminate the worker. Unknown execution retains its lease and stops automatic rounds until the host reconciles the outcome.
+- There is no remote admission ledger, durable cycle request ID, automatic mutation retry, cancellation or package integration in this facade. Those require a later receiver integration; the local runtime does not claim exactly-once cycle execution across process death.
+- Reads currently use `MemoryView` enumeration. MORK parity and a non-preempting lease policy have not been implemented by this change.
