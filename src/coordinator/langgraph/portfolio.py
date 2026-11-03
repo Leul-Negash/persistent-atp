@@ -16,7 +16,8 @@ from typing import Any, Mapping
 
 from commit_gate.gate import CommitGate
 from commit_gate.state import ReadView
-from commit_gate.store import JournalStore
+from commit_gate.store import JournalStore, ConcurrencyError
+from commit_gate.reasons import Reason
 from mathproof.cycle import CycleDigest, run_cycle
 from mathproof.scheduler import Candidate, GlobalScheduler, SchedulerStatistics
 
@@ -43,10 +44,18 @@ PORTFOLIO = (
 class SlotScheduler(GlobalScheduler):
     """The global scheduler, restricted to one frontier category."""
 
-    def __init__(self, view, store, *, category: str, statistics: SchedulerStatistics):
+    def __init__(self, view, store, *, category: str, statistics: SchedulerStatistics,
+                 expected_revision: int | None = None):
         super().__init__(view, store, statistics=statistics)
         self.category = category
         self.last_lease = None
+        self.expected_revision = expected_revision
+
+    def _snapshot_frontier(self, proof_id):
+        revision, frontier = super()._snapshot_frontier(proof_id)
+        if self.expected_revision is not None and revision != self.expected_revision:
+            raise ConcurrencyError(Reason.STALE_BASE_REVISION, "slot assessment revision changed")
+        return revision, frontier
 
     def lease_next(self, *args, **kwargs):
         self.last_lease = super().lease_next(*args, **kwargs)
@@ -74,17 +83,24 @@ def run_portfolio(
     store: JournalStore,
     *,
     slots: tuple[Slot, ...] = PORTFOLIO,
+    expected_revision: int | None = None,
 ) -> list[dict[str, Any]]:
     """Run one cycle per slot that has work; report each as plain data."""
     proof_id = workspace.proof_id
     gate = CommitGate(workspace.view, store)
     reports = []
     for slot in slots:
-        project(workspace.view, store, proof_id)
+        revision = project(workspace.view, store, proof_id)
+        if expected_revision is not None and revision != expected_revision:
+            reports.append({"slot": slot.role, "worker_class": slot.worker_class,
+                "move_id": None, "accepted": False, "revision": None,
+                "rejections": [Reason.STALE_BASE_REVISION.value], "outcome": "stale-assessment"})
+            break
         if not frontier_by_category(workspace, store).get(slot.category):
             continue
         scheduler = SlotScheduler(
-            workspace.view, store, category=slot.category, statistics=workspace.statistics
+            workspace.view, store, category=slot.category, statistics=workspace.statistics,
+            expected_revision=expected_revision,
         )
         try:
             digest = run_cycle(
@@ -100,12 +116,14 @@ def run_portfolio(
         except Exception as exc:
             lease = scheduler.last_lease
             known_invalid = isinstance(exc, InvalidMechanisms)
+            stale = isinstance(exc, ConcurrencyError) and lease is None
             if known_invalid and lease is not None:
                 scheduler.release(proof_id, lease.lease_id, fencing_token=lease.fencing_token)
             reports.append({"slot": slot.role, "worker_class": slot.worker_class,
                 "move_id": lease.selected_move_id if lease else None, "accepted": False,
-                "revision": None, "rejections": [],
-                "outcome": "invalid-worker-result" if known_invalid else "execution-unknown",
+                "revision": None, "rejections": [exc.reason.value] if stale else [],
+                "outcome": "invalid-worker-result" if known_invalid else
+                           "stale-assessment" if stale else "execution-unknown",
                 "error_code": type(exc).__name__, "detail": str(exc)[:500]})
             # Unknown execution may still be in flight. Keep its fencing lease
             # alive, and never dispatch a replacement inside this call.

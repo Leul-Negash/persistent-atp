@@ -11,6 +11,7 @@ cache of the journal and never a second copy of the proof.
 from __future__ import annotations
 
 from typing import Any
+from contextlib import closing
 
 from .escalate import commit_escalations
 from .policy import StagnationPolicy, classify
@@ -18,7 +19,7 @@ from .portfolio import PORTFOLIO, Slot, frontier_by_category, run_portfolio
 from .progress import ProofReading, read_proof
 from .workspace import ProofWorkspace, project
 
-__all__ = ["ACTIVE", "SOLVED", "PARKED", "STALLED", "new_track", "work", "assess"]
+__all__ = ["ACTIVE", "SOLVED", "PARKED", "STALLED", "WAITING", "new_track", "work", "assess"]
 
 ACTIVE = "active"
 SOLVED = "solved"
@@ -26,6 +27,7 @@ PARKED = "parked"
 """Waiting on replay with nothing else to lease: no cycle can move it."""
 STALLED = "stalled"
 """Nothing to lease and every escalation already on record: a human decides."""
+WAITING = "waiting-on-worker"
 
 
 def new_track() -> dict[str, Any]:
@@ -37,10 +39,10 @@ def work(
     workspace: ProofWorkspace, round_number: int, *, slots: tuple[Slot, ...] = PORTFOLIO
 ) -> dict[str, Any]:
     """Run this round's portfolio on one proof and report it."""
-    with workspace.lock:
-        store = workspace.open_store()
+    with workspace.lock, closing(workspace.open_store()) as store:
         revision = project(workspace.view, store, workspace.proof_id)
-        before = read_proof(workspace.view, workspace.proof_id, revision)
+        _, snapshot = workspace.view.snapshot(workspace.proof_id)
+        before = read_proof(snapshot, workspace.proof_id, revision)
         return {
             "proof_id": workspace.proof_id,
             "round": round_number,
@@ -62,19 +64,29 @@ def assess(
     """
     proof_id = workspace.proof_id
     round_number = report["round"]
-    with workspace.lock:
-        store = workspace.open_store()
+    with workspace.lock, closing(workspace.open_store()) as store:
         revision = project(workspace.view, store, proof_id)
-        reading = read_proof(workspace.view, proof_id, revision)
+        _, snapshot = workspace.view.snapshot(proof_id)
+        reading = read_proof(snapshot, proof_id, revision)
         frontier = frontier_by_category(workspace, store)
         earlier = _reading_from(report["before"], revision)
         milestones = _progress_milestones(proof_id, earlier, reading)
+        if store.head(proof_id)[0] != revision:
+            return ({**track, "status": ACTIVE}, [],
+                    [f"{proof_id}: assessment became stale; refresh before deciding"])
+        if any(slot.get("outcome") == "execution-unknown" for slot in report["slots"]):
+            # A timeout is not proof that work stopped. Do not preempt its
+            # lease or dispatch replacement work via a later policy round.
+            milestones.append(f"{proof_id}: worker outcome unknown; reconcile before resuming")
+            return ({"status": WAITING, "progress": list(reading.progress),
+                     "stalled_rounds": track["stalled_rounds"],
+                     "awaiting_replay": reading.awaiting_replay}, [], milestones)
         stalled_rounds = 0 if reading.advanced_from(earlier) else track["stalled_rounds"] + 1
         if reading.awaiting_replay and not track["awaiting_replay"]:
             milestones.append(f"{proof_id}: a certificate awaits replay; formal search pauses")
 
         escalations = classify(
-            workspace.view,
+            snapshot,
             proof_id,
             reading,
             stalled_rounds=stalled_rounds,
@@ -100,7 +112,7 @@ def assess(
         if reading.solved:
             status = SOLVED
             milestones.append(f"{proof_id}: solved; every registered target is Lean verified")
-        elif not frontier_by_category(workspace, store):
+        elif (commit is None or commit.accepted) and not frontier_by_category(workspace, store):
             if reading.awaiting_replay:
                 status = PARKED
             else:

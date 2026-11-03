@@ -29,6 +29,7 @@ from .policy import StagnationPolicy
 from .portfolio import PORTFOLIO, Slot
 from .rounds import ACTIVE, SOLVED, assess, new_track, work
 from .workspace import ProofWorkspace
+from .runtime import CoordinatorRuntime
 
 __all__ = ["CoordinatorState", "Coordinator", "HALTED", "BUDGET_EXHAUSTED"]
 
@@ -64,7 +65,8 @@ class Coordinator:
     ):
         if max_rounds < 1:
             raise ValueError("a coordinator run needs at least one round")
-        self.workspaces = {workspace.proof_id: workspace for workspace in workspaces}
+        self.runtime = CoordinatorRuntime(workspaces)
+        self.workspaces = self.runtime.workspaces
         self.max_rounds = max_rounds
         self.policy = policy
         self.slots = slots
@@ -113,7 +115,7 @@ class Coordinator:
 
     def _work(self, order: WorkOrder) -> dict[str, Any]:
         workspace = self.workspaces[order["proof_id"]]
-        return {"reports": [work(workspace, order["round"], slots=self.slots)]}
+        return {"reports": [self.runtime.work(workspace.proof_id, order["round"], slots=self.slots)]}
 
     def _assess(self, state: CoordinatorState) -> dict[str, Any]:
         tracks = dict(state["tracks"])
@@ -123,8 +125,8 @@ class Coordinator:
             if report["round"] != state["round"]:
                 continue
             proof_id = report["proof_id"]
-            track, raised, messages = assess(
-                self.workspaces[proof_id], tracks[proof_id], report, policy=self.policy
+            track, raised, messages = self.runtime.assess(
+                proof_id, tracks[proof_id], report, policy=self.policy
             )
             tracks[proof_id] = track
             escalations.extend({"proof_id": proof_id, "round": report["round"], **e} for e in raised)
