@@ -3,7 +3,7 @@
     plan_round --Send per active proof--> work --> assess --> plan_round | END
 
 `plan_round` opens a round and fans the active proofs out with `Send`; each
-`work` branch runs one proof's portfolio on its own store connection, so the
+`work` branch delegates one proof's portfolio to the runtime, so the
 expensive cycles of different proofs overlap. `assess` joins the round: it
 judges every proof from committed state, commits the escalations the
 stagnation policy calls for and decides whether another round is worth
@@ -27,7 +27,8 @@ from langgraph.types import Send
 
 from .policy import StagnationPolicy
 from .portfolio import PORTFOLIO, Slot
-from .rounds import ACTIVE, SOLVED, assess, new_track, work
+from .contracts import RoundRuntime
+from .rounds import ACTIVE, SOLVED, new_track
 from .workspace import ProofWorkspace
 from .runtime import CoordinatorRuntime
 
@@ -53,23 +54,44 @@ class WorkOrder(TypedDict):
 
 
 class Coordinator:
-    """Runs rounds over several proofs until each is solved or the budget ends."""
+    """Runs rounds over several proofs until each is solved or the budget ends.
+
+    Supply local ``workspaces`` or a ``runtime`` implementing :class:`RoundRuntime`.
+    An injected runtime needs no workspace mapping. Its registered proof IDs
+    are captured at construction; a run does not discover new proofs mid-round.
+    """
 
     def __init__(
         self,
-        workspaces: Sequence[ProofWorkspace],
+        workspaces: Sequence[ProofWorkspace] | None = None,
         *,
+        runtime: RoundRuntime | None = None,
         max_rounds: int = 8,
         policy: StagnationPolicy = StagnationPolicy(),
         slots: tuple[Slot, ...] = PORTFOLIO,
     ):
         if max_rounds < 1:
             raise ValueError("a coordinator run needs at least one round")
-        self.runtime = CoordinatorRuntime(workspaces)
-        self.workspaces = self.runtime.workspaces
+        if (workspaces is None) == (runtime is None):
+            raise ValueError("supply either workspaces or runtime")
+        self.runtime = CoordinatorRuntime(workspaces) if runtime is None else runtime
+        if not isinstance(self.runtime, RoundRuntime):
+            raise TypeError("runtime must implement proof_ids, work and assess")
+        self.proof_ids = tuple(self.runtime.proof_ids)
+        if any(not isinstance(p, str) or not p for p in self.proof_ids):
+            raise ValueError("runtime proof IDs must be nonempty strings")
+        if len(set(self.proof_ids)) != len(self.proof_ids):
+            raise ValueError("runtime proof IDs must be unique")
         self.max_rounds = max_rounds
         self.policy = policy
         self.slots = slots
+
+    @property
+    def workspaces(self):
+        """Original local registry; injected runtimes need not expose workspaces."""
+        if isinstance(self.runtime, CoordinatorRuntime):
+            return self.runtime.workspaces
+        raise AttributeError("workspace access requires a local CoordinatorRuntime")
 
     def build(self, checkpointer=None):
         graph = StateGraph(CoordinatorState)
@@ -85,7 +107,7 @@ class Coordinator:
     def initial_state(self) -> CoordinatorState:
         return {
             "round": 0,
-            "tracks": {proof_id: new_track() for proof_id in self.workspaces},
+            "tracks": {proof_id: new_track() for proof_id in self.proof_ids},
             "reports": [],
             "escalations": [],
             "milestones": [],
@@ -114,8 +136,10 @@ class Coordinator:
         ]
 
     def _work(self, order: WorkOrder) -> dict[str, Any]:
-        workspace = self.workspaces[order["proof_id"]]
-        return {"reports": [self.runtime.work(workspace.proof_id, order["round"], slots=self.slots)]}
+        report = self.runtime.work(order["proof_id"], order["round"], slots=self.slots)
+        if report["proof_id"] != order["proof_id"] or report["round"] != order["round"]:
+            raise ValueError("runtime report belongs to another proof or round")
+        return {"reports": [report]}
 
     def _assess(self, state: CoordinatorState) -> dict[str, Any]:
         tracks = dict(state["tracks"])

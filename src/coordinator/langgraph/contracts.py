@@ -14,10 +14,11 @@ from typing import Any, Protocol, runtime_checkable
 from commit_gate.state import EdgeRecord, NodeRecord
 from mathproof.scheduler import Candidate
 
-from .policy import Escalation
+from .policy import Escalation, StagnationPolicy
+from .portfolio import PORTFOLIO, Slot
 from .progress import ProofReading
 
-__all__ = ["CoordinationState", "ProofBackend", "StaleAssessment"]
+__all__ = ["CoordinationState", "ProofBackend", "RoundRuntime", "StaleAssessment"]
 
 
 class StaleAssessment(ValueError):
@@ -110,4 +111,31 @@ class ProofBackend(Protocol):
     def queue_escalations(self, proof_id: str, escalations: Sequence[Escalation], *,
                           expected_revision: int, round_number: int) -> dict:
         """Queue at most 100 complete escalations atomically, preserving policy identity."""
+        ...
+
+
+@runtime_checkable
+class RoundRuntime(Protocol):
+    """Graph-facing rounds, distinct from the lower-level execution backend.
+
+    Implementations own committed-state reads and policy assessment. The graph
+    needs no workspace, store, credentials or worker registry. Calls for
+    different proofs may overlap; implementations must preserve proof isolation.
+    Reports, tracks and assessment results must contain checkpoint-safe data.
+    """
+
+    @property
+    def proof_ids(self) -> tuple[str, ...]:
+        """Registered proofs in stable order, without opening a proof store."""
+        ...
+
+    def work(self, proof_id: str, round_number: int, *,
+             slots: tuple[Slot, ...] = PORTFOLIO) -> dict[str, Any]:
+        """Run one proof's portfolio and return a scoped plain-data report."""
+        ...
+
+    def assess(self, proof_id: str, track: dict[str, Any], report: dict[str, Any], *,
+               policy: StagnationPolicy = StagnationPolicy()
+               ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+        """Re-read committed state, apply policy and return track and milestones."""
         ...
