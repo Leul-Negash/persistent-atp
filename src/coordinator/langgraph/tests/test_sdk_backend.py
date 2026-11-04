@@ -269,12 +269,19 @@ sys.meta_path.insert(0, BlockSDK())
 sys.path.insert(0, sys.argv[1])
 from coordinator.langgraph import CoordinatorRuntime
 from coordinator.langgraph.sdk_backend import SDKBackend
+from coordinator.langgraph.sdk_operations import DurableSDKOperations
 try:
     SDKBackend(None, workspace_id='lab', proof_ids=('p1',))
 except ImportError as exc:
     assert 'requires persistent-atp-client 0.2' in str(exc)
 else:
     raise AssertionError('missing dependency did not block adapter construction')
+try:
+    DurableSDKOperations(None, '/unused/cache.sqlite3', receiver_id='test', workspace_id='lab', proof_ids=('p1',))
+except ImportError as exc:
+    assert 'requires persistent-atp-client 0.2' in str(exc)
+else:
+    raise AssertionError('missing dependency did not block durable operations')
 """
         result = subprocess.run([sys.executable, "-I", "-c", code, source],
                                 capture_output=True, text=True, timeout=10)

@@ -150,8 +150,9 @@ reconciliation, execution-time revision checks, and a structured atomic
 escalation contract. The SDK's generic guidance action does not preserve all
 coordinator escalation metadata, so it is not used as a substitute.
 
-The opt-in HTTP test reads an existing idle proof without submitting work.
-Keep other workers paused on that proof while comparing the two reads:
+The opt-in HTTP tests read an existing idle proof and submit a read-only audit.
+They also reattach to that audit from a fresh Python process. Keep other workers
+paused on that proof while comparing the committed graph before and after:
 
 ```bash
 export PERSISTENT_ATP_COORDINATION_TEST_URL=http://127.0.0.1:8000
@@ -166,6 +167,63 @@ The test explicitly skips if its optional SDK/HTTP dependency or receiver
 configuration is missing. A reference receiver establishes read interoperability
 with its recorded component mode; it does not establish production persistence
 or independent Lean replay.
+
+## Durable SDK request identity
+
+`DurableSDKOperations` persists the canonical prepared request before delivery,
+then records its operation reference and observed versions in a separate local
+SQLite file. The receiver owns the authoritative admission and operation ledger;
+the proof journal remains the authority for mathematical state. The client file
+contains no credentials or fencing tokens and must not share a path with either
+service database. Keep `receiver_id` bound to the same receiver and principal.
+
+Use this helper with an existing SDK client, workspace and proof registry:
+
+```python
+from persistent_atp_client import ProofAudit
+from coordinator.langgraph.sdk_operations import DurableSDKOperations, OperationPending
+
+operations = DurableSDKOperations(
+    client,
+    "tmp/coordinator/client-intents.sqlite3",
+    receiver_id="my-receiver",
+    workspace_id="reference",
+    proof_ids=("existing-proof",),
+)
+intent = operations.prepare("audit-demo-001", ProofAudit("existing-proof"))
+try:
+    result = await operations.advance(intent.intent_id, timeout=5)
+    print(result.lifecycle, result.mathematical_disposition)
+except OperationPending as pending:
+    # Persist these plain identities with the coordinator checkpoint.
+    print(pending.checkpoint_ref)
+```
+
+This code runs inside the asynchronous client lifetime shown above. On restart,
+reopen the same file and call `restore(checkpoint_ref)` and then
+`await operations.advance(intent_id, timeout=5)`. Reattachment checks the receiver;
+it does not treat a cached terminal result as a new authoritative response.
+
+An uncertain submission is looked up using its original request ID and
+fingerprint. A missing admission leaves it unresolved. An explicit
+`retry_same_request=True` permits resending the exact persisted body, retaining
+its request ID, deadline and preconditions. No code automatically renews the
+deadline, rebases a stale request, or creates a replacement intent. A confirmed
+stale rejection requires fresh assessment and a new explicit intent ID.
+Receiver retention and idempotency guarantees still apply; expired identities
+and protocol errors surface to the caller.
+
+Observation timeouts preserve running work and its reference; they do not call
+receiver cancellation. Observation versions, request/proof scope and reported
+journal identity are checked across client restarts. Concurrent callers can
+claim the first send only once. Subsequent observations and explicit retries
+still rely on receiver idempotency rather than a client-side exactly-once claim.
+
+The helper is transport plumbing and can submit explicitly prepared SDK actions.
+It does **not** provide missing execution preconditions or structured escalation
+semantics. `SDKBackend.run_slot` and `SDKBackend.queue_escalations` remain blocked
+until those receiver contracts are implemented. A succeeded audit establishes
+operation completion only; proof status must be read from committed evidence.
 
 The facade and LangGraph graph reuse the original round, portfolio, scheduler, dispatcher and gate implementations. There is no `persistent-atp-client` dependency in this stage.
 
