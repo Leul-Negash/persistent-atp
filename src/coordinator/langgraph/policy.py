@@ -26,11 +26,11 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
-from commit_gate.state import MemoryView
 from shared.vocab import ObstructionKind, RunDisposition
 
 from .progress import (
     ProofReading,
+    PolicyView,
     coordinator_moves,
     misaligned_declarations,
     obstructions_by_run,
@@ -101,7 +101,7 @@ class StagnationPolicy:
 
 
 def classify(
-    view: MemoryView,
+    view: PolicyView,
     proof_id: str,
     reading: ProofReading,
     *,
@@ -229,7 +229,7 @@ def classify(
 
 
 def _not_on_record(
-    view: MemoryView, proof_id: str, reading: ProofReading, raised: list[Escalation]
+    view: PolicyView, proof_id: str, reading: ProofReading, raised: list[Escalation]
 ) -> list[Escalation]:
     on_record = set()
     for move in coordinator_moves(view, proof_id):

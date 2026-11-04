@@ -13,9 +13,10 @@ from .rounds import assess, new_track, work
 from .workspace import ProofWorkspace, project
 from .contracts import CoordinationState, ProofBackend, RoundRuntime, StaleAssessment
 from .runtime import CoordinatorRuntime
+from .backend_runtime import BackendRoundRuntime
 
 __all__ = [
-    "CoordinatorRuntime", "CoordinationState", "ProofBackend", "RoundRuntime", "StaleAssessment",
+    "CoordinatorRuntime", "BackendRoundRuntime", "CoordinationState", "ProofBackend", "RoundRuntime", "StaleAssessment",
     "COORDINATOR_ACTOR",
     "Escalation",
     "PORTFOLIO",

@@ -14,20 +14,13 @@ from typing import Any
 from contextlib import closing
 
 from .escalate import commit_escalations
-from .policy import StagnationPolicy, classify
+from .policy import StagnationPolicy
 from .portfolio import PORTFOLIO, Slot, frontier_by_category, run_portfolio
-from .progress import ProofReading, read_proof
+from .progress import read_proof
+from .assessment import ACTIVE, SOLVED, PARKED, STALLED, WAITING, plan_assessment, finish_assessment
 from .workspace import ProofWorkspace, project
 
 __all__ = ["ACTIVE", "SOLVED", "PARKED", "STALLED", "WAITING", "new_track", "work", "assess"]
-
-ACTIVE = "active"
-SOLVED = "solved"
-PARKED = "parked"
-"""Waiting on replay with nothing else to lease: no cycle can move it."""
-STALLED = "stalled"
-"""Nothing to lease and every escalation already on record: a human decides."""
-WAITING = "waiting-on-worker"
 
 
 def new_track() -> dict[str, Any]:
@@ -63,95 +56,27 @@ def assess(
     Returns the updated track, the escalations committed, and the milestones.
     """
     proof_id = workspace.proof_id
-    round_number = report["round"]
     with workspace.lock, closing(workspace.open_store()) as store:
         revision = project(workspace.view, store, proof_id)
         _, snapshot = workspace.view.snapshot(proof_id)
         reading = read_proof(snapshot, proof_id, revision)
         frontier = frontier_by_category(workspace, store)
-        earlier = _reading_from(report["before"], revision)
-        milestones = _progress_milestones(proof_id, earlier, reading)
         if store.head(proof_id)[0] != revision:
             return ({**track, "status": ACTIVE}, [],
                     [f"{proof_id}: assessment became stale; refresh before deciding"])
-        if any(slot.get("outcome") == "execution-unknown" for slot in report["slots"]):
-            # A timeout is not proof that work stopped. Do not preempt its
-            # lease or dispatch replacement work via a later policy round.
-            milestones.append(f"{proof_id}: worker outcome unknown; reconcile before resuming")
-            return ({"status": WAITING, "progress": list(reading.progress),
-                     "stalled_rounds": track["stalled_rounds"],
-                     "awaiting_replay": reading.awaiting_replay}, [], milestones)
-        stalled_rounds = 0 if reading.advanced_from(earlier) else track["stalled_rounds"] + 1
-        if reading.awaiting_replay and not track["awaiting_replay"]:
-            milestones.append(f"{proof_id}: a certificate awaits replay; formal search pauses")
-
-        escalations = classify(
-            snapshot,
-            proof_id,
-            reading,
-            stalled_rounds=stalled_rounds,
-            frontier_empty=not frontier,
-            policy=policy,
-        )
-        committed: list[dict[str, Any]] = []
-        commit = commit_escalations(
-            store, workspace.view, proof_id, escalations, reading=reading, round_number=round_number
-        )
+        plan = plan_assessment(snapshot, proof_id, reading, track, report,
+                               frontier_empty=not frontier, policy=policy)
+        if plan.deferred_status is not None:
+            return finish_assessment(proof_id, plan, frontier_empty=not frontier)
+        commit = commit_escalations(store, workspace.view, proof_id, plan.escalations,
+                                    reading=reading, round_number=report["round"])
         if commit is not None and commit.accepted:
             project(workspace.view, store, proof_id)
-            for escalation in escalations:
-                committed.append(
-                    {"rule": escalation.rule, "target_id": escalation.target_id, "detail": escalation.detail}
-                )
-                milestones.append(f"{proof_id}: {escalation.rule} -- {escalation.detail}")
-        elif commit is not None:
-            reasons = ", ".join(rejection.reason.value for rejection in commit.rejections)
-            milestones.append(f"{proof_id}: escalation proposal rejected ({reasons})")
-
-        status = ACTIVE
-        if reading.solved:
-            status = SOLVED
-            milestones.append(f"{proof_id}: solved; every registered target is Lean verified")
-        elif (commit is None or commit.accepted) and not frontier_by_category(workspace, store):
-            if reading.awaiting_replay:
-                status = PARKED
-            else:
-                status = STALLED
-                milestones.append(
-                    f"{proof_id}: nothing left to lease and every escalation is on record; "
-                    "needs a human decision"
-                )
-        return (
-            {
-                "status": status,
-                "progress": list(reading.progress),
-                "stalled_rounds": stalled_rounds,
-                "awaiting_replay": reading.awaiting_replay,
-            },
-            committed,
-            milestones,
+        return finish_assessment(
+            proof_id, plan, frontier_empty=not frontier_by_category(workspace, store),
+            outcome="duplicate" if commit is None else "accepted" if commit.accepted else "rejected",
+            committed=plan.escalations if commit is not None and commit.accepted else (),
+            rejection_reasons=[r.reason.value for r in commit.rejections] if commit is not None else (),
+            refresh_required=store.head(proof_id)[0] != (
+                commit.revision if commit is not None and commit.accepted else revision),
         )
-
-
-def _reading_from(progress: list[int], revision: int) -> ProofReading:
-    settled, closed, replayed = progress
-    return ProofReading(
-        revision=revision,
-        settled_claims=settled,
-        closed_states=closed,
-        replayed_declarations=replayed,
-    )
-
-
-def _progress_milestones(
-    proof_id: str, earlier: ProofReading, reading: ProofReading
-) -> list[str]:
-    messages = []
-    for name, now, then in (
-        ("claims settled", reading.settled_claims, earlier.settled_claims),
-        ("formal states closed", reading.closed_states, earlier.closed_states),
-        ("declarations replayed", reading.replayed_declarations, earlier.replayed_declarations),
-    ):
-        if now > then:
-            messages.append(f"{proof_id}: {now - then} {name}")
-    return messages

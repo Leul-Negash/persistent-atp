@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Mapping, Protocol
 
-from commit_gate.state import MemoryView, NodeRecord
+from commit_gate.state import ReadView, NodeRecord
 from shared.vocab import (
     AlignmentVerdict,
     ClaimStatus,
@@ -24,6 +24,7 @@ from shared.vocab import (
 
 __all__ = [
     "ProofReading",
+    "PolicyView",
     "read_proof",
     "nodes_of",
     "run_declaration",
@@ -44,6 +45,13 @@ CLOSED_STATES = frozenset(
     {FormalStateStatus.FORMALLY_CLOSED.value, FormalStateStatus.LEAN_VERIFIED.value}
 )
 PENDING_CERTIFICATES = frozenset({"candidate", "replay-pending"})
+
+
+class PolicyView(ReadView, Protocol):
+    """Read-only enumeration used by policy; no store or projection mutators."""
+
+    @property
+    def nodes(self) -> Mapping[str, NodeRecord]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,14 +90,14 @@ class ProofReading:
         return any(now > then for now, then in zip(self.progress, earlier.progress))
 
 
-def nodes_of(view: MemoryView, proof_id: str, label: str) -> Iterator[NodeRecord]:
+def nodes_of(view: PolicyView, proof_id: str, label: str) -> Iterator[NodeRecord]:
     prefix = f"{proof_id}/"
     for node_id, record in list(view.nodes.items()):
         if node_id.startswith(prefix) and record.label == label:
             yield record
 
 
-def read_proof(view: MemoryView, proof_id: str, revision: int) -> ProofReading:
+def read_proof(view: PolicyView, proof_id: str, revision: int) -> ProofReading:
     def count(label: str, statuses: frozenset[str]) -> int:
         return sum(
             1 for node in nodes_of(view, proof_id, label)
@@ -115,13 +123,13 @@ def read_proof(view: MemoryView, proof_id: str, revision: int) -> ProofReading:
     )
 
 
-def run_declaration(view: MemoryView, run_id: str) -> str | None:
+def run_declaration(view: PolicyView, run_id: str) -> str | None:
     """The declaration a formal run searches, if it names exactly one."""
     targets = {edge.dst_id for edge in view.edges_from(run_id, "SEARCHES")}
     return next(iter(targets)) if len(targets) == 1 else None
 
 
-def obstructions_by_run(view: MemoryView, proof_id: str) -> dict[str, list[NodeRecord]]:
+def obstructions_by_run(view: PolicyView, proof_id: str) -> dict[str, list[NodeRecord]]:
     raised: dict[str, list[NodeRecord]] = defaultdict(list)
     for run in nodes_of(view, proof_id, "FormalRun"):
         for edge in view.edges_from(run.node_id, "RAISED_OBSTRUCTION"):
@@ -131,7 +139,7 @@ def obstructions_by_run(view: MemoryView, proof_id: str) -> dict[str, list[NodeR
     return raised
 
 
-def residual_of(view: MemoryView, obstruction_id: str) -> tuple[str, str] | None:
+def residual_of(view: PolicyView, obstruction_id: str) -> tuple[str, str] | None:
     """The state an obstruction is stuck at: its id and semantic signature."""
     for edge in view.edges_from(obstruction_id, "AT_STATE"):
         state = view.node(edge.dst_id)
@@ -140,7 +148,7 @@ def residual_of(view: MemoryView, obstruction_id: str) -> tuple[str, str] | None
     return None
 
 
-def misaligned_declarations(view: MemoryView, proof_id: str) -> dict[str, str]:
+def misaligned_declarations(view: PolicyView, proof_id: str) -> dict[str, str]:
     """Declarations a reviewed alignment says do not state the claim."""
     unsound = {
         AlignmentVerdict.MISMATCH.value,
@@ -158,7 +166,7 @@ def misaligned_declarations(view: MemoryView, proof_id: str) -> dict[str, str]:
     return found
 
 
-def refuted_reviews(view: MemoryView, proof_id: str) -> Iterator[tuple[NodeRecord, str]]:
+def refuted_reviews(view: PolicyView, proof_id: str) -> Iterator[tuple[NodeRecord, str]]:
     """Critic attempts that refuted a claim still waiting on a verdict."""
     for attempt in nodes_of(view, proof_id, "Attempt"):
         if attempt.fields.get("worker_class") != "critic" or attempt.fields.get("status") != "refuted":
@@ -169,7 +177,7 @@ def refuted_reviews(view: MemoryView, proof_id: str) -> Iterator[tuple[NodeRecor
                 yield attempt, claim.node_id
 
 
-def coordinator_moves(view: MemoryView, proof_id: str) -> Iterator[NodeRecord]:
+def coordinator_moves(view: PolicyView, proof_id: str) -> Iterator[NodeRecord]:
     """Every move the coordinator has proposed, worked or not."""
     for state in nodes_of(view, proof_id, "ResearchState"):
         if state.fields.get("role") != COORDINATOR_ROLE:
