@@ -58,12 +58,16 @@ class CoordinationState:
     edges: tuple[EdgeRecord, ...]
     frontier: tuple[Candidate, ...]
     escalations: tuple[NodeRecord, ...]
+    component_mode: str | None = None
 
     def __post_init__(self):
         if type(self.revision) is not int or self.revision < 0:
             raise ValueError("coordination revision must be a nonnegative integer")
         if self.progress.revision != self.revision:
             raise ValueError("progress belongs to another coordination revision")
+        if self.component_mode is not None and (not isinstance(self.component_mode, str)
+                or not 1 <= len(self.component_mode) <= 128):
+            raise ValueError("component_mode must be a bounded nonempty string")
         object.__setattr__(self, "nodes", tuple(
             NodeRecord(n.node_id, n.label, _freeze(n.fields)) for n in self.nodes))
         object.__setattr__(self, "edges", tuple(
@@ -76,7 +80,7 @@ class CoordinationState:
             NodeRecord(n.node_id, n.label, _freeze(n.fields)) for n in self.escalations))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"proof_id": self.proof_id, "revision": self.revision,
+        result = {"proof_id": self.proof_id, "revision": self.revision,
             "journal_hash": self.journal_hash, "progress": asdict(self.progress),
             "nodes": [{"id": n.node_id, "label": n.label, "fields": _plain(n.fields)} for n in self.nodes],
             "edges": [{"id": e.edge_id, "rel_type": e.rel_type, "src_id": e.src_id,
@@ -84,6 +88,9 @@ class CoordinationState:
             "frontier": [{"move_id": c.move_id, "category": c.category, "detail": c.detail,
                 "features": _plain(c.features), "conflict_ids": list(c.conflict_ids)} for c in self.frontier],
             "escalation_ids": [n.node_id for n in self.escalations]}
+        if self.component_mode is not None:
+            result["component_mode"] = self.component_mode
+        return result
 
 
 @runtime_checkable

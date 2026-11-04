@@ -98,6 +98,75 @@ round_result = runtime.run_round(proof_id, 2, new_track())
 
 The existing proof-wide escalation lease still supersedes active dispatches. The receipt includes observed lease audit events so supersession is visible, without exposing fencing tokens. This is not a non-preempting queue. The audit is separate from the proof hash chain.
 
+## Optional SDK coordination reads
+
+`SDKBackend` reads a complete proof graph and frontier through the standalone
+`persistent-atp-client` SDK. It negotiates coordination reads under contract
+`2.1`, checks every page against one journal revision and hash, and rejects
+incomplete or inconsistent snapshots. Reads have configurable page, record,
+byte, retry and time bounds. Returned records are immutable copies; receiver
+component modes, including scripted modes, remain visible on the snapshot.
+
+Install the SDK from its separate checkout first, then the optional binding:
+
+```bash
+uv pip install --python .venv/bin/python \
+  -e '/path/to/sdk-checkout/packages/persistent-atp-client[http]'
+uv pip install --python .venv/bin/python -e '.[langgraph,sdk]'
+```
+
+With a compatible receiver and an existing proof, read its committed state:
+
+```python
+import asyncio
+import os
+
+from persistent_atp_client import AsyncClient
+from persistent_atp_client.adapters.http import HTTPReceiverAdapter
+from coordinator.langgraph.sdk_backend import SDKBackend
+
+async def main():
+    port = HTTPReceiverAdapter(
+        os.environ["PERSISTENT_ATP_URL"],
+        os.environ["PERSISTENT_ATP_TOKEN"],
+    )
+    async with AsyncClient(port) as client:
+        backend = SDKBackend(client, workspace_id="reference", proof_ids=("existing-proof",))
+        state = await backend.aread_coordination("existing-proof")
+        print(state.revision, state.progress.solved, state.component_mode)
+
+asyncio.run(main())
+```
+
+Synchronous graph worker threads can use `backend.read_coordination(proof_id)`.
+The caller owns the client's lifetime and credentials. The current SDK HTTP
+adapter supports separate event loops; a custom local port must provide the
+same property when shared across synchronous worker threads.
+
+This binding currently supports **reads only**. `run_slot` and
+`queue_escalations` raise `UnsupportedCapability` before submitting anything.
+Running coordinator rounds remotely still requires durable request
+reconciliation, execution-time revision checks, and a structured atomic
+escalation contract. The SDK's generic guidance action does not preserve all
+coordinator escalation metadata, so it is not used as a substitute.
+
+The opt-in HTTP test reads an existing idle proof without submitting work.
+Keep other workers paused on that proof while comparing the two reads:
+
+```bash
+export PERSISTENT_ATP_COORDINATION_TEST_URL=http://127.0.0.1:8000
+# Set PERSISTENT_ATP_COORDINATION_TEST_TOKEN to your receiver token.
+export PERSISTENT_ATP_COORDINATION_TEST_WORKSPACE=reference
+export PERSISTENT_ATP_COORDINATION_TEST_PROOF=existing-proof
+.venv/bin/python -m pytest -q -rs \
+  src/coordinator/langgraph/tests/test_sdk_backend_http.py
+```
+
+The test explicitly skips if its optional SDK/HTTP dependency or receiver
+configuration is missing. A reference receiver establishes read interoperability
+with its recorded component mode; it does not establish production persistence
+or independent Lean replay.
+
 The facade and LangGraph graph reuse the original round, portfolio, scheduler, dispatcher and gate implementations. There is no `persistent-atp-client` dependency in this stage.
 
 ## Running
