@@ -5,63 +5,21 @@ Workspaces and workers are supplied by the trusted host at registration.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from types import MappingProxyType
-from typing import Any
 
-from commit_gate.state import NodeRecord, EdgeRecord
-from mathproof.scheduler import Candidate, GlobalScheduler
+from commit_gate.state import NodeRecord
+from mathproof.scheduler import GlobalScheduler
 
 from .escalate import commit_escalations
 from .policy import Escalation, RULES, _not_on_record
 from .portfolio import PORTFOLIO, run_portfolio
-from .progress import ProofReading, coordinator_moves, read_proof
+from .progress import coordinator_moves, read_proof
 from .rounds import work, assess
 from .workspace import ProofWorkspace, project
-
-
-class StaleAssessment(ValueError):
-    """Refresh committed state and reassess; the runtime never auto-rebases."""
-
-
-def _freeze(value):
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    return value
-
-
-def _plain(value):
-    if isinstance(value, Mapping):
-        return {key: _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain(item) for item in value]
-    return value
-
-
-@dataclass(frozen=True)
-class CoordinationState:
-    proof_id: str
-    revision: int
-    journal_hash: str
-    progress: ProofReading
-    nodes: tuple[NodeRecord, ...]
-    edges: tuple[EdgeRecord, ...]
-    frontier: tuple[Candidate, ...]
-    escalations: tuple[NodeRecord, ...]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"proof_id": self.proof_id, "revision": self.revision,
-            "journal_hash": self.journal_hash, "progress": asdict(self.progress),
-            "nodes": [{"id": n.node_id, "label": n.label, "fields": _plain(n.fields)} for n in self.nodes],
-            "edges": [{"id": e.edge_id, "rel_type": e.rel_type, "src_id": e.src_id,
-                "dst_id": e.dst_id, "fields": _plain(e.fields)} for e in self.edges],
-            "frontier": [{"move_id": c.move_id, "category": c.category, "detail": c.detail,
-                "features": _plain(c.features), "conflict_ids": list(c.conflict_ids)} for c in self.frontier],
-            "escalation_ids": [n.node_id for n in self.escalations]}
+from .contracts import CoordinationState, StaleAssessment
 
 
 class CoordinatorRuntime:
@@ -78,6 +36,10 @@ class CoordinatorRuntime:
                 raise ValueError("register each nonempty proof ID exactly once")
             registry[workspace.proof_id] = workspace
         self.workspaces = MappingProxyType(registry)
+
+    @property
+    def proof_ids(self) -> tuple[str, ...]:
+        return tuple(self.workspaces)
 
     def _workspace(self, proof_id):
         try:
@@ -102,13 +64,10 @@ class CoordinatorRuntime:
             if store.head(proof_id) != head:
                 continue
             prefix = proof_id + "/"
-            nodes = tuple(NodeRecord(n.node_id, n.label, _freeze(n.fields))
-                for _, n in sorted(snapshot.nodes.items()) if n.node_id.startswith(prefix))
-            edges = tuple(EdgeRecord(e.edge_id, e.rel_type, e.src_id, e.dst_id, _freeze(e.fields))
-                for _, e in sorted(snapshot.edges.items()) if e.edge_id.startswith(prefix))
+            nodes = tuple(n for _, n in sorted(snapshot.nodes.items()) if n.node_id.startswith(prefix))
+            edges = tuple(e for _, e in sorted(snapshot.edges.items()) if e.edge_id.startswith(prefix))
             state = CoordinationState(proof_id, revision, head[1], reading, nodes, edges,
-                tuple(Candidate(c.move_id, c.category, c.detail, _freeze(c.features), c.conflict_ids)
-                      for c in frontier),
+                tuple(frontier),
                 tuple(n for n in nodes if n.node_id in {
                     move.node_id for move in coordinator_moves(snapshot, proof_id)}))
             return snapshot, state
