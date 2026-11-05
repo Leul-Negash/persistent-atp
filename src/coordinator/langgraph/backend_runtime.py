@@ -94,12 +94,21 @@ class BackendRoundRuntime:
             commit = result.get("commit")
             if commit:
                 reasons = [r["reason"] for r in commit.get("rejections", ())]
-            expected_head = result.get("revision", expected_head)
+            if outcome == "accepted":
+                if (not commit or commit.get("accepted") is not True
+                        or type(commit.get("revision")) is not int
+                        or commit["revision"] != state.revision + 1
+                        or result.get("revision") != commit["revision"]):
+                    raise ValueError("escalation receipt does not identify the expected atomic commit")
+                expected_head = commit["revision"]
         if outcome in {"execution-unknown", "stale-assessment"}:
             return finish_assessment(proof_id, plan, frontier_empty=False, outcome=outcome)
         latest, _ = self._read(proof_id)
         if latest.revision == state.revision and latest.journal_hash != state.journal_hash:
             raise ValueError("journal identity changed within one assessment revision")
+        if outcome == "accepted" and latest.revision == expected_head:
+            if commit.get("event_hash") != latest.journal_hash:
+                raise ValueError("escalation receipt journal hash differs from the committed snapshot")
         # A known commit can still be reported, but a later concurrent
         # mutation means this assessment cannot park or solve the proof.
         return finish_assessment(

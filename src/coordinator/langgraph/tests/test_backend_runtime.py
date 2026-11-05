@@ -185,6 +185,48 @@ class TestBackendRounds(JournalCase):
                 {"proof_id": "p1", "round": 1, "before": [0, 0, 0], "slots": []})
         backend.queue_escalations.assert_called_once()
 
+    def test_duplicate_receipt_cannot_silently_rebase_the_assessment_head(self):
+        self.seed("p1", UpsertNode("Proof", "p1/proof", {}))
+        backend = self.backend()
+        def concurrent_duplicate(*args, **kwargs):
+            self.seed("p1", UpsertNode("ResearchState", "p1/rs-other", {"status": "open", "role": "coordinator"}),
+                UpsertNode("ResearchMove", "p1/rm-other", {"status": "exhausted", "escalation": "global-audit",
+                    "basis": "0/0/0", "target_id": "p1"}),
+                AddEdge("PROPOSES", "p1/rs-other", "p1/rm-other", "p1/other-proposes"))
+            return {"proof_id": "p1", "outcome": "duplicate", "revision": 2, "commit": None}
+        backend.queue_escalations.side_effect = concurrent_duplicate
+        track, _, messages = BackendRoundRuntime(backend).assess("p1", new_track(),
+            {"proof_id": "p1", "round": 1, "before": [0, 0, 0], "slots": []})
+        self.assertEqual(track["status"], ACTIVE)
+        self.assertTrue(any("became stale" in m for m in messages))
+
+    def test_atomic_commit_receipt_cannot_jump_to_an_unrelated_revision(self):
+        from dataclasses import asdict
+        self.seed("p1", UpsertNode("Proof", "p1/proof", {}))
+        backend = self.backend()
+        backend.queue_escalations.side_effect = lambda proof_id, items, **options: {
+            "proof_id": proof_id, "outcome": "accepted", "revision": 99,
+            "escalations": [asdict(e) for e in items],
+            "commit": {"accepted": True, "revision": 99, "rejections": []}}
+        with self.assertRaisesRegex(ValueError, "expected atomic commit"):
+            BackendRoundRuntime(backend).assess("p1", new_track(),
+                {"proof_id": "p1", "round": 1, "before": [0, 0, 0], "slots": []})
+
+    def test_commit_hash_must_match_the_snapshot_at_the_accepted_revision(self):
+        for proof_id, bad_hash in (("p1", None), ("p2", "sha256:" + "f" * 64)):
+            with self.subTest(bad_hash=bad_hash):
+                self.seed(proof_id, UpsertNode("Proof", proof_id + "/proof", {}))
+                backend = BackendOnly(CoordinatorRuntime([self.workspace(proof_id)]))
+                original = backend.queue_escalations
+                def corrupt_receipt(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    result["commit"]["event_hash"] = bad_hash
+                    return result
+                backend.queue_escalations = Mock(side_effect=corrupt_receipt)
+                with self.assertRaisesRegex(ValueError, "receipt journal hash"):
+                    BackendRoundRuntime(backend).assess(proof_id, new_track(),
+                        {"proof_id": proof_id, "round": 1, "before": [0, 0, 0], "slots": []})
+
     def test_operation_success_alone_does_not_solve_a_registered_target(self):
         self.seed("p1", *aligned_claim("p1"), UpsertNode("Proof", "p1/proof", {}),
             AddEdge("HAS_TARGET", "p1/proof", "p1/c-1", "p1/target"))

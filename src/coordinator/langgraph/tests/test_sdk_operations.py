@@ -284,3 +284,17 @@ class TestDurableSDKOperations(unittest.TestCase):
         self.port._operations[ref] = replace(first, observation_version=2, journal_hash="sha256:" + "b" * 64)
         with self.assertRaisesRegex(ReceiverProtocolError, "journal revision or identity"):
             asyncio.run(self.controller().advance(intent.intent_id, timeout=1))
+
+    def test_terminal_operation_accepts_live_project_progress_without_changing_its_result(self):
+        controller = self.controller()
+        intent = self.prepared(controller)
+        terminal = asyncio.run(controller.advance(intent.intent_id, timeout=1))
+        first = replace(terminal, project_revision=1, journal_hash="sha256:" + "a" * 64, projection_watermark=1)
+        self.port._operations[terminal.ref] = first
+        asyncio.run(self.controller().advance(intent.intent_id, timeout=1))
+        later = replace(first, project_revision=2, journal_hash="sha256:" + "b" * 64, projection_watermark=2)
+        self.port._operations[terminal.ref] = later
+        observed = asyncio.run(self.controller().advance(intent.intent_id, timeout=1))
+        self.assertEqual(observed.result, terminal.result)
+        self.assertEqual(observed.project_revision, 2)
+        self.assertEqual(len(self.port.submits), 1)

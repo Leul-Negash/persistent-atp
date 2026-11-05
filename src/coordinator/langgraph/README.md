@@ -215,9 +215,18 @@ and protocol errors surface to the caller.
 
 Observation timeouts preserve running work and its reference; they do not call
 receiver cancellation. Observation versions, request/proof scope and reported
-journal identity are checked across client restarts. Concurrent callers can
+journal identity are checked across client restarts. Operation results remain
+immutable; current project revision/hash/watermark may advance independently.
+Duplicate receipts do not rebase an assessment, and an accepted escalation
+receipt must identify the expected atomic commit and match the reread journal
+hash at that revision. Concurrent callers can
 claim the first send only once. Subsequent observations and explicit retries
 still rely on receiver idempotency rather than a client-side exactly-once claim.
+
+An opt-in HTTP regression creates its own throwaway proof and queues research
+guidance to verify live project metadata after an audit completes. Run it only
+with `PERSISTENT_ATP_COORDINATOR_MUTATION_TESTS=1`; ordinary configured HTTP
+checks continue to read/audit the supplied idle proof.
 
 The helper is transport plumbing and can submit explicitly prepared SDK actions.
 It does **not** provide missing execution preconditions or structured escalation

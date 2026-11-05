@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 
 try:
     import persistent_atp_client
@@ -89,3 +90,37 @@ asyncio.run(main())
                                    capture_output=True, text=True, timeout=15)
             self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
             self.assertEqual(json.loads(child.stdout), checkpoint)
+
+    def test_completed_audit_accepts_an_advancing_project_head(self):
+        if os.environ.get("PERSISTENT_ATP_COORDINATOR_MUTATION_TESTS") != "1":
+            self.skipTest("opt in to queued research writes on a throwaway proof with PERSISTENT_ATP_COORDINATOR_MUTATION_TESTS=1")
+        from persistent_atp_client import Preconditions, ResearchGuidance
+        url, token, workspace, proof = self.configured_receiver()
+        with tempfile.TemporaryDirectory() as directory:
+            async def scenario():
+                async with AsyncClient(HTTPReceiverAdapter(url, token)) as client:
+                    proof = "live-meta-" + uuid.uuid4().hex[:12]
+                    spec = json.dumps({"proof_id": proof, "title": "Live operation metadata test",
+                                       "literal_target": "True"}).encode()
+                    artifact = await client.put_artifact(spec, workspace_id=workspace, media_type="application/json")
+                    created = await client.proof_create(artifact, workspace_id=workspace)
+                    self.assertEqual((await created.wait(timeout=5)).lifecycle, "succeeded")
+                    backend = SDKBackend(client, workspace_id=workspace, proof_ids=(proof,))
+                    before = await backend.aread_coordination(proof)
+                    cache = Path(directory) / "intents.sqlite3"
+                    operations = DurableSDKOperations(client, cache, receiver_id="reference-test",
+                        workspace_id=workspace, proof_ids=(proof,))
+                    intent = operations.prepare("audit-live-metadata", ProofAudit(proof))
+                    original = await operations.advance(intent.intent_id, timeout=5)
+                    work = await client.queue_research_moves(proof, "metadata-progress",
+                        (ResearchGuidance("audit", "Audit the next research round", proof + "/c-1"),),
+                        workspace_id=workspace,
+                        preconditions=Preconditions(expected_revision=before.revision))
+                    self.assertEqual((await work.wait(timeout=5)).lifecycle, "succeeded")
+                    reopened = DurableSDKOperations(client, cache, receiver_id="reference-test",
+                        workspace_id=workspace, proof_ids=(proof,))
+                    observed = await reopened.advance(intent.intent_id, timeout=5)
+                    self.assertEqual(observed.ref, original.ref)
+                    self.assertEqual(observed.result, original.result)
+                    self.assertGreater(observed.project_revision, original.project_revision)
+            asyncio.run(scenario())

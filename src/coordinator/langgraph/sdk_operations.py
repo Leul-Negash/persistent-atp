@@ -247,10 +247,17 @@ class DurableSDKOperations:
                 raise self._sdk.ProtocolError("operation observation belongs to another durable request or proof")
             if record.observation_json is not None:
                 previous = json.loads(record.observation_json)
+                # The receiver reports current project metadata even when the
+                # operation itself is unchanged. Keep operation identity/results
+                # immutable, and check the project chain independently below.
+                current = json.loads(payload)
+                live_fields = {"project_revision", "journal_hash", "projection_watermark"}
+                operation_changed = ({k: v for k, v in current.items() if k not in live_fields}
+                                     != {k: v for k, v in previous.items() if k not in live_fields})
                 if (snapshot.observation_version < previous["observation_version"]
                         or ((snapshot.observation_version == previous["observation_version"]
                              or previous["lifecycle"] in self._sdk.terminal)
-                            and payload != record.observation_json)):
+                            and operation_changed)):
                     raise self._sdk.ProtocolError("operation observation regressed or changed without a valid transition")
                 if previous["project_revision"] is not None and snapshot.project_revision is not None:
                     if (snapshot.project_revision < previous["project_revision"]
