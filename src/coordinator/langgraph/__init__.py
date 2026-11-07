@@ -11,8 +11,12 @@ from .portfolio import PORTFOLIO, Slot, SlotScheduler, run_portfolio
 from .progress import ProofReading, read_proof
 from .rounds import assess, new_track, work
 from .workspace import ProofWorkspace, project
+from .contracts import CoordinationState, ProofBackend, RoundRuntime, StaleAssessment
+from .runtime import CoordinatorRuntime
+from .backend_runtime import BackendRoundRuntime
 
 __all__ = [
+    "CoordinatorRuntime", "BackendRoundRuntime", "CoordinationState", "ProofBackend", "RoundRuntime", "StaleAssessment",
     "COORDINATOR_ACTOR",
     "Escalation",
     "PORTFOLIO",

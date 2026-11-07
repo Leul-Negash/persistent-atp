@@ -223,6 +223,10 @@ class JournalStore:
                 """
             )
 
+    def close(self) -> None:
+        """Release this caller-owned connection and its WAL resources."""
+        self._conn.close()
+
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         """Hold the database write lock for the whole block, or roll back."""

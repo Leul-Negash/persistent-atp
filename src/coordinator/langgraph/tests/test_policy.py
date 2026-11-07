@@ -154,7 +154,9 @@ class TestPolicyOrder(unittest.TestCase):
 
     def test_a_solved_proof_raises_nothing(self):
         view = MemoryView()
-        view.add_node("p1/fd-1", "FormalDeclaration", {"status": "replay-accepted"})
+        view.add_node("p1/proof", "Proof", {})
+        view.add_node("p1/c-1", "Claim", {"status": "lean-verified"})
+        view.add_edge("HAS_TARGET", "p1/proof", "p1/c-1", "p1/target")
         self.assertEqual(rules(view, stalled_rounds=9, frontier_empty=True), [])
 
     def test_a_certificate_awaiting_replay_is_not_stagnation(self):
@@ -217,11 +219,17 @@ class TestReading(unittest.TestCase):
         self.assertTrue(after.advanced_from(before))
         self.assertFalse(before.advanced_from(after))
 
-    def test_a_proof_is_solved_when_every_declaration_is_replayed(self):
+    def test_unrelated_replayed_declarations_do_not_solve_the_target(self):
         view = proof()
         view.add_node("p1/fd-2", "FormalDeclaration", {"status": "replay-accepted"})
         self.assertFalse(read_proof(view, "p1", 0).solved)
         view.set_field("p1/fd-1", "status", "replay-accepted")
+        self.assertFalse(read_proof(view, "p1", 0).solved)
+        view.add_node("p1/proof", "Proof", {})
+        view.add_node("p1/c-1", "Claim", {"status": "critic-accepted"})
+        view.add_edge("HAS_TARGET", "p1/proof", "p1/c-1", "p1/target")
+        self.assertFalse(read_proof(view, "p1", 0).solved)
+        view.set_field("p1/c-1", "status", "lean-verified")
         self.assertTrue(read_proof(view, "p1", 0).solved)
         self.assertFalse(ProofReading(revision=0).solved)
 

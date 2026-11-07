@@ -16,6 +16,44 @@ from mathproof.dispatch import ScriptedDispatcher
 from mathproof.formal_atp import FakeFormalATP
 
 from coordinator.langgraph.workspace import ProofWorkspace, project
+from coordinator.langgraph.mechanisms import MECHANISM_FIELDS, mechanism_moves
+
+
+def mechanism_answer():
+    """Complete scripted research answers, never formal evidence."""
+    answers = []
+    for tag in ("induction", "extremal", "algebraic", "analytic", "probabilistic"):
+        value = {name: f"{name} via {tag}" for name in MECHANISM_FIELDS}
+        value.update(technique_tags=[tag], prerequisites=[], promise=.5, cost=.5,
+                     novelty=.5, risk=.5, stance="proves")
+        answers.append(value)
+    return answers
+
+
+def verified_target(proof_id):
+    """Synthetic bound replay records for gate tests; no real Lean was run."""
+    ids = {name: f"{proof_id}/{name}" for name in
+           ("proof", "c-verified", "fd-verified", "env-v", "fr-v", "cert-v", "replay-v", "al-v")}
+    p, c, d, env, run, cert, replay, al = ids.values()
+    env_hash, artifact = "sha256:" + "e" * 64, "sha256:" + "a" * 64
+    ops = [UpsertNode("Proof", p, {}), UpsertNode("Claim", c, {"status": "lean-verified"}),
+        UpsertNode("FormalDeclaration", d, {"status": "replay-accepted"}),
+        UpsertNode("Environment", env, {"environment_hash": env_hash}),
+        UpsertNode("FormalRun", run, {"status": "proved-pending-replay", "environment_hash": env_hash}),
+        UpsertNode("Certificate", cert, {"actor": "scripted-producer", "status": "replay-accepted",
+            "artifact_hash": artifact, "environment_hash": env_hash, "producer_run_id": run}),
+        UpsertNode("LeanReplay", replay, {"actor": "scripted-replayer", "status": "verified",
+            "sorry_detected": False, "environment_hash": env_hash,
+            "certificate_id": cert, "artifact_hash": artifact}),
+        UpsertNode("Alignment", al, {"lifecycle": "reviewed", "verdict": "aligned"})]
+    for index, (rel, src, dst) in enumerate((
+        ("HAS_TARGET", p, c), ("PROVED_BY", c, cert), ("REPLAYED_BY", cert, replay),
+        ("CERTIFIES", cert, d), ("PRODUCED_CERTIFICATE", run, cert), ("SEARCHES", run, d),
+        ("PINNED_ENVIRONMENT", d, env), ("CERTIFICATE_ENVIRONMENT", cert, env),
+        ("RAN_UNDER", run, env), ("REPLAY_ENVIRONMENT", replay, env),
+        ("ALIGNS_CLAIM", al, c), ("ALIGNS_DECLARATION", al, d))):
+        ops.append(AddEdge(rel, src, dst, f"{proof_id}/v-edge-{index}"))
+    return ops
 
 
 def declaration(proof_id: str, serial: int = 1, status: str = "aligned") -> UpsertNode:
@@ -124,7 +162,8 @@ def explorer(answers: Mapping[str, Any] | None = None, worked: list | None = Non
             worked.append(lease.selected_move_id)
         return {
             "parent_state_id": packet["parent_state"]["id"],
-            "moves": list((answers or {}).get(move.get("escalation"), [])),
+            "moves": list((answers or {}).get(move.get("escalation"),
+                mechanism_moves(mechanism_answer()) if move.get("escalation") == "five-mechanisms" else [])),
             "move_status": "exhausted",
         }
 

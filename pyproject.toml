@@ -24,6 +24,10 @@ dev = [
 langgraph = [
     "langgraph>=1.0",
 ]
+# Optional coordinator binding; the SDK is distributed separately.
+sdk = [
+    "persistent-atp-client>=0.2.0,<0.3",
+]
 # The production backend is not on PyPI and lives in a private repository,
 # so plain pip cannot resolve it — [tool.uv.sources] below applies to uv
 # only. Install it with `uv sync --extra real-atp`; everything else
